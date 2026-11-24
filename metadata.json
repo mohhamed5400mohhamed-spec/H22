@@ -1,0 +1,11 @@
+{
+  "name": "Remix Remix Remix Remix Remix HassanApp",
+  "description": "شات دردشه كتابي صوتي حسان برو",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
