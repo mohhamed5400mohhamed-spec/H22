@@ -4792,6 +4792,11 @@ export default function App() {
       setSettingNameColor(persistentNameColor);
       setSettingTextColor(persistentTextColor);
       setNameGradient(persistentNameGradient);
+      if (user.theme) setActiveTheme(user.theme);
+      if (user.fontFamily) setFontFamily(user.fontFamily);
+      if (user.wallpaper) setActiveWallpaper(user.wallpaper);
+      if (user.bubbleStyle) setBubbleStyle(user.bubbleStyle);
+      if ((user as any).fontSize) setChatFontSize((user as any).fontSize);
 
       setIsSubmitting(false);
       setLoginError(null);
@@ -4839,6 +4844,11 @@ export default function App() {
       setSettingNameColor(persistentNameColor);
       setSettingTextColor(persistentTextColor);
       setNameGradient(persistentNameGradient);
+      if (user.theme) setActiveTheme(user.theme);
+      if (user.fontFamily) setFontFamily(user.fontFamily);
+      if (user.wallpaper) setActiveWallpaper(user.wallpaper);
+      if (user.bubbleStyle) setBubbleStyle(user.bubbleStyle);
+      if ((user as any).fontSize) setChatFontSize((user as any).fontSize);
 
       setIsSubmitting(false);
       setLoginError(null);
@@ -6576,6 +6586,7 @@ export default function App() {
       socket?.emit('updateGlobalAppearance', { theme: themeId });
       showToast('تم تطبيق الثيم وتعميمه على كافة المتواجدين والغرف بنجاح! 🎨📢', 'success');
     } else {
+      socket?.emit('updateUserPreferences', { theme: themeId });
       showToast('تم تطبيق الثيم الجديد بنجاح! 🎨', 'success');
     }
   };
@@ -6586,6 +6597,7 @@ export default function App() {
       localStorage.setItem('soqoor_font_family', fontId);
       localStorage.setItem('soqoor_font_user_set', 'true');
     } catch {}
+    setCurrentUser((prev) => (prev ? { ...prev, fontFamily: fontId } : null));
 
     const canBroadcast =
       currentUser?.role === 'hassan' ||
@@ -6596,6 +6608,7 @@ export default function App() {
       socket?.emit('updateGlobalAppearance', { fontFamily: fontId });
       showToast('تم تعميم نوع الخط على كافة المتواجدين والغرف بنجاح! 🖋️📢', 'success');
     } else {
+      socket?.emit('updateUserPreferences', { fontFamily: fontId });
       showToast('تم تغيير نوع الخط بنجاح! 🖋️', 'success');
     }
   };
@@ -6625,6 +6638,8 @@ export default function App() {
       localStorage.setItem('soqoor_wallpaper_user_set', 'true');
     } catch {}
 
+    setCurrentUser((prev) => (prev ? { ...prev, wallpaper: wallpaperId } : null));
+
     const canBroadcast =
       currentUser?.role === 'hassan' ||
       currentUser?.role === 'admin' ||
@@ -6634,6 +6649,7 @@ export default function App() {
       socket?.emit('updateGlobalAppearance', { wallpaper: wallpaperId });
       showToast('تم تعميم الخلفية على كافة المتواجدين والغرف بنجاح! 🖼️📢', 'success');
     } else {
+      socket?.emit('updateUserPreferences', { wallpaper: wallpaperId });
       showToast('تم تغيير خلفية الشات بنجاح! 🖼️', 'success');
     }
   };
@@ -6644,6 +6660,7 @@ export default function App() {
       localStorage.setItem('soqoor_bubble_style', styleId);
       localStorage.setItem('soqoor_bubble_user_set', 'true');
     } catch {}
+    setCurrentUser((prev) => (prev ? { ...prev, bubbleStyle: styleId } : null));
 
     const canBroadcast =
       currentUser?.role === 'hassan' ||
@@ -6654,6 +6671,7 @@ export default function App() {
       socket?.emit('updateGlobalAppearance', { bubbleStyle: styleId });
       showToast('تم تعميم شكل الفقاعات على كافة المتواجدين والغرف بنجاح! 💬📢', 'success');
     } else {
+      socket?.emit('updateUserPreferences', { bubbleStyle: styleId });
       showToast('تم تغيير شكل الفقاعات بنجاح! 💬', 'success');
     }
   };
@@ -6737,6 +6755,13 @@ export default function App() {
         theme: targetTheme,
         fontFamily: targetFont,
         fontWeight: targetWeight,
+        wallpaper: targetWall,
+        bubbleStyle: targetBubble
+      });
+    } else if (socket && currentUser) {
+      socket.emit('updateUserPreferences', {
+        theme: targetTheme,
+        fontFamily: targetFont,
         wallpaper: targetWall,
         bubbleStyle: targetBubble
       });

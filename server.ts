@@ -246,6 +246,7 @@ app.get('/api/ice-servers', (_req, res) => {
 });
 
 const httpRateLimitMap = new Map<string, { count: number; resetAt: number }>();
+const hourlyPointsRewardMap = new Map<string, { total: number; resetAt: number }>();
 function checkHttpRateLimit(bucket: string, key: string, maxRequests: number, windowMs: number): boolean {
   const now = Date.now();
   const composite = `${bucket}:${key}`;
@@ -6111,6 +6112,9 @@ setInterval(() => {
     for (const [key, rl] of httpRateLimitMap.entries()) {
       if (rl.resetAt <= now) httpRateLimitMap.delete(key);
     }
+    for (const [key, bucket] of hourlyPointsRewardMap.entries()) {
+      if (bucket.resetAt <= now) hourlyPointsRewardMap.delete(key);
+    }
     for (const [key, entry] of ytSearchCache.entries()) {
       if (now - entry.ts >= YT_CACHE_TTL_MS) ytSearchCache.delete(key);
     }
@@ -6538,21 +6542,37 @@ io.on('connection', (socket) => {
   );
 
   // تعيين السوابر / البنر المصور للعضو
-  socket.on('assignMemberBanner', ({ username, bannerUrl }: { username: string; bannerUrl?: string }) => {
+  socket.on('assignMemberBanner', async ({ username, bannerUrl }: { username: string; bannerUrl?: string }) => {
     const actor = users.find((u) => u.id === socket.id);
-    if (!actor) return;
+    if (!actor || actor.role === 'guest') return;
+    if (actor.isJailed || actor.isTextMuted) {
+      socket.emit('systemAlert', 'لا يمكنك تعديل البنر أثناء التقييد الإداري.');
+      return;
+    }
     const cleanUser = sanitizeText(username)?.trim();
     if (!cleanUser) return;
 
-    const isSelf = actor.username.toLowerCase() === cleanUser.toLowerCase();
-    const canAssign = isSelf || isSupremeHassan(actor) || actor.role === 'admin' || actor.role === 'super' || hasPermission(actor.role, 'canAssignBanner') || getRoleLevel(actor.role) >= 75;
+    const canAssign = isSupremeHassan(actor) || actor.role === 'admin' || actor.role === 'super' || hasPermission(actor.role, 'canAssignBanner') || getRoleLevel(actor.role) >= 75;
 
     if (!canAssign) {
-      socket.emit('systemAlert', 'تعيين البنر لعضو آخر محصور بطاقم الإدارة أو الرتب الممنوحة هذه الصلاحية.');
+      socket.emit('systemAlert', 'تعيين البنر محصور بطاقم الإدارة أو الرتب الممنوحة هذه الصلاحية.');
+      return;
+    }
+    if (!checkHttpRateLimit('assignBanner', actor.username.toLowerCase(), 6, 60_000)) {
+      socket.emit('systemAlert', '⏳ يرجى الانتظار قليلاً قبل تحديث بنر عضو آخر.');
       return;
     }
 
-    const cleanBannerUrl = sanitizeUrl(bannerUrl) || undefined;
+    const rawBanner = typeof bannerUrl === 'string' ? bannerUrl.trim() : '';
+    let cleanBannerUrl: string | undefined;
+    if (rawBanner) {
+      const persisted = await ensureMediaUrlNotBase64(rawBanner);
+      if (!persisted) {
+        socket.emit('systemAlert', 'رابط البنر غير صالح أو غير آمن.');
+        return;
+      }
+      cleanBannerUrl = persisted;
+    }
 
     users.forEach((u) => {
       if (u.username.toLowerCase() === cleanUser.toLowerCase()) {
@@ -7253,9 +7273,9 @@ io.on('connection', (socket) => {
   // Check Ghost Login Permission for login screen (فحص صلاحية الدخول المخفي للاسم قبل الدخول)
   socket.on('checkGhostPermission', ({ username }: { username: string }, callback?: (res: { allowed: boolean }) => void) => {
     const clean = sanitizeText(username || '').trim();
-    if (!clean) {
+    if (!clean || clean.length < 2 || clean.length > 64 || !checkHttpRateLimit('ghostCheck', clientIp, 6, 60_000)) {
       if (typeof callback === 'function') callback({ allowed: false });
-      socket.emit('ghostPermissionResult', { username: '', allowed: false });
+      socket.emit('ghostPermissionResult', { username: clean || '', allowed: false });
       return;
     }
     const reg = getRegisteredMember(clean)?.member;
@@ -7484,10 +7504,14 @@ io.on('connection', (socket) => {
       if (!trimmedFrame) {
         nextFrame = undefined;
       } else if (trimmedFrame.startsWith('frame:')) {
-        nextFrame = sanitizeText(trimmedFrame);
+        nextFrame = sanitizeText(trimmedFrame).slice(0, 120);
       } else {
         const persisted = await ensureMediaUrlNotBase64(trimmedFrame);
-        nextFrame = persisted || trimmedFrame;
+        if (!persisted) {
+          socket.emit('systemAlert', 'رابط أو ملف إطار الصورة الشخصية غير صالح.');
+          return;
+        }
+        nextFrame = persisted;
       }
       user.avatarFrame = nextFrame;
     }
@@ -7498,10 +7522,14 @@ io.on('connection', (socket) => {
       if (!trimmedBg) {
         nextBg = undefined;
       } else if (trimmedBg.startsWith('bg:')) {
-        nextBg = sanitizeText(trimmedBg);
+        nextBg = sanitizeText(trimmedBg).slice(0, 120);
       } else {
         const persisted = await ensureMediaUrlNotBase64(trimmedBg);
-        nextBg = persisted || trimmedBg;
+        if (!persisted) {
+          socket.emit('systemAlert', 'رابط أو ملف خلفية العضوية غير صالح.');
+          return;
+        }
+        nextBg = persisted;
       }
       user.memberBg = nextBg;
       user.profileBg = nextBg;
@@ -7954,14 +7982,21 @@ io.on('connection', (socket) => {
       : undefined;
     const cleanBubbleStyle = typeof bubbleStyle === 'string' && /^[a-zA-Z0-9_-]{1,40}$/.test(bubbleStyle.trim()) ? bubbleStyle.trim() : undefined;
 
-    // Global appearance is controlled exclusively by administrators. Never let
-    // login/profile updates overwrite the server-wide appearance.
+    // Global appearance defaults are managed by admins, while personal preferences persist to this member's account.
+    if (cleanTheme) (user as any).theme = cleanTheme;
+    if (cleanFontFamily) (user as any).fontFamily = cleanFontFamily;
+    if (cleanWallpaper !== undefined) (user as any).wallpaper = cleanWallpaper || undefined;
+    if (cleanBubbleStyle) (user as any).bubbleStyle = cleanBubbleStyle;
     if (cleanFontSize) (user as any).fontSize = cleanFontSize;
     if (safeNameColor !== undefined) user.nameColor = safeNameColor || undefined;
     if (safeTextColor !== undefined) user.textColor = safeTextColor || undefined;
 
     const regPrefFound = getRegisteredMember(user.username);
     if (regPrefFound) {
+      if (cleanTheme) regPrefFound.member.theme = cleanTheme;
+      if (cleanFontFamily) regPrefFound.member.fontFamily = cleanFontFamily;
+      if (cleanWallpaper !== undefined) regPrefFound.member.wallpaper = cleanWallpaper || undefined;
+      if (cleanBubbleStyle) regPrefFound.member.bubbleStyle = cleanBubbleStyle;
       if (cleanFontSize) (regPrefFound.member as any).fontSize = cleanFontSize;
       if (safeNameColor !== undefined) (regPrefFound.member as any).nameColor = safeNameColor || undefined;
       if (safeTextColor !== undefined) (regPrefFound.member as any).textColor = safeTextColor || undefined;
@@ -7971,9 +8006,14 @@ io.on('connection', (socket) => {
     const sessionToken = user.sessionToken;
     if (sessionToken && activeSessions.has(sessionToken)) {
       const sess = activeSessions.get(sessionToken)!;
+      if (cleanTheme) (sess.user as any).theme = cleanTheme;
+      if (cleanFontFamily) (sess.user as any).fontFamily = cleanFontFamily;
+      if (cleanWallpaper !== undefined) (sess.user as any).wallpaper = cleanWallpaper || undefined;
+      if (cleanBubbleStyle) (sess.user as any).bubbleStyle = cleanBubbleStyle;
       if (cleanFontSize) (sess.user as any).fontSize = cleanFontSize;
       if (safeNameColor !== undefined) sess.user.nameColor = safeNameColor || undefined;
       if (safeTextColor !== undefined) sess.user.textColor = safeTextColor || undefined;
+      persistActiveSessions();
     }
 
     // Acknowledge back to user only - does NOT broadcast to other members!
@@ -8068,13 +8108,13 @@ io.on('connection', (socket) => {
 
   socket.on('addShortcut', ({ trigger, replacement }: { trigger: string; replacement: string }) => {
     const admin = findSocketUser(socket.id);
-    if (!admin || (!isSupremeHassan(admin) && admin.role !== 'admin' && admin.role !== 'super')) {
-      socket.emit('systemAlert', 'إدارة وتعديل الاختصارات محصورة بطاقم الإدارة (Admin/Super).');
+    if (!admin || (!isSupremeHassan(admin) && admin.role !== 'admin' && admin.role !== 'super' && !hasPermission(admin.role, 'canManageShortcuts'))) {
+      socket.emit('systemAlert', 'إدارة وتعديل الاختصارات محصورة بطاقم الإدارة أو الرتب المصرح لها.');
       return;
     }
 
-    const cleanTrigger = sanitizeText(trigger)?.trim();
-    const cleanReplacement = sanitizeText(replacement)?.trim();
+    const cleanTrigger = sanitizeText(trigger)?.trim().slice(0, 32);
+    const cleanReplacement = sanitizeText(replacement)?.trim().slice(0, 300);
 
     if (!cleanTrigger || !cleanReplacement) {
       socket.emit('systemAlert', 'يرجى إدخال رمز الاختصار والجملة البديلة كاملة.');
@@ -8090,6 +8130,10 @@ io.on('connection', (socket) => {
       chatShortcuts[existingIndex].createdBy = admin.username;
       chatShortcuts[existingIndex].createdAt = Date.now();
     } else {
+      if (chatShortcuts.length >= 250) {
+        socket.emit('systemAlert', 'تم بلوغ الحد الأقصى لعدد الاختصارات (250 اختصاراً).');
+        return;
+      }
       const newShortcut: ChatShortcut = {
         id: `sc-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
         trigger: cleanTrigger,
@@ -8112,8 +8156,8 @@ io.on('connection', (socket) => {
 
   socket.on('deleteShortcut', ({ shortcutId }: { shortcutId: string }) => {
     const admin = findSocketUser(socket.id);
-    if (!admin || (!isSupremeHassan(admin) && admin.role !== 'admin' && admin.role !== 'super')) {
-      socket.emit('systemAlert', 'إدارة الاختصارات محصورة بطاقم الإدارة (Admin/Super).');
+    if (!admin || (!isSupremeHassan(admin) && admin.role !== 'admin' && admin.role !== 'super' && !hasPermission(admin.role, 'canManageShortcuts'))) {
+      socket.emit('systemAlert', 'إدارة الاختصارات محصورة بطاقم الإدارة أو الرتب المصرح لها.');
       return;
     }
 
@@ -8129,13 +8173,13 @@ io.on('connection', (socket) => {
 
   socket.on('updateShortcut', ({ id, trigger, replacement }: { id: string; trigger: string; replacement: string }) => {
     const admin = findSocketUser(socket.id);
-    if (!admin || (!isSupremeHassan(admin) && admin.role !== 'admin' && admin.role !== 'super')) {
-      socket.emit('systemAlert', 'إدارة وتعديل الاختصارات محصورة بطاقم الإدارة (Admin/Super).');
+    if (!admin || (!isSupremeHassan(admin) && admin.role !== 'admin' && admin.role !== 'super' && !hasPermission(admin.role, 'canManageShortcuts'))) {
+      socket.emit('systemAlert', 'إدارة وتعديل الاختصارات محصورة بطاقم الإدارة أو الرتب المصرح لها.');
       return;
     }
 
-    const cleanTrigger = sanitizeText(trigger)?.trim();
-    const cleanReplacement = sanitizeText(replacement)?.trim();
+    const cleanTrigger = sanitizeText(trigger)?.trim().slice(0, 32);
+    const cleanReplacement = sanitizeText(replacement)?.trim().slice(0, 300);
 
     if (!cleanTrigger || !cleanReplacement) {
       socket.emit('systemAlert', 'يرجى إدخال رمز الاختصار والجملة البديلة كاملة.');
@@ -9521,7 +9565,6 @@ io.on('connection', (socket) => {
       admin.role === 'admin' ||
       admin.role === 'super' ||
       hasPermission(admin.role, 'canChangeRoomSettings') ||
-      hasPermission(admin.role, 'canAccessControlPanel') ||
       getRoleLevel(admin.role) >= 75
     ));
 
@@ -9537,8 +9580,11 @@ io.on('connection', (socket) => {
 
     if (room) {
       if (isAuthorized) {
-        if (data.name !== undefined) room.name = sanitizeText(data.name);
-        if (data.desc !== undefined) room.desc = sanitizeText(data.desc);
+        if (data.name !== undefined) {
+          const cleanName = sanitizeText(data.name).slice(0, 60);
+          if (cleanName) room.name = cleanName;
+        }
+        if (data.desc !== undefined) room.desc = sanitizeText(data.desc).slice(0, 200);
         if (data.voiceLimit !== undefined) {
           const nextLimit = Number(data.voiceLimit);
           if (Number.isFinite(nextLimit) && nextLimit >= 1) {
@@ -9551,7 +9597,7 @@ io.on('connection', (socket) => {
         } else if (data.isPasswordProtected === true || (data.password && data.password.trim())) {
           if (data.password && data.password.trim()) {
             room.isPasswordProtected = true;
-            room.password = sanitizeText(data.password.trim());
+            room.password = sanitizeText(data.password.trim()).slice(0, 64);
           }
         }
       }
@@ -9564,7 +9610,11 @@ io.on('connection', (socket) => {
             delete room.bannerUrl;
           } else {
             const safeBanner = await ensureMediaUrlNotBase64(cleanBanner);
-            room.bannerUrl = safeBanner || cleanBanner;
+            if (!safeBanner) {
+              socket.emit('systemAlert', 'رابط بنر الغرفة غير صالح أو غير آمن.');
+            } else {
+              room.bannerUrl = safeBanner;
+            }
           }
         }
       }
@@ -9573,19 +9623,36 @@ io.on('connection', (socket) => {
     }
     if (isAuthorized) {
       const curSettings = getRoomSettings(canonicalRoomId);
-      if (data.isChatLocked !== undefined) curSettings.isChatLocked = data.isChatLocked;
-      if (data.slowModeSeconds !== undefined) curSettings.slowModeSeconds = data.slowModeSeconds;
-      if (data.isVoiceLocked !== undefined) curSettings.isVoiceLocked = data.isVoiceLocked;
+      if (data.isChatLocked !== undefined) curSettings.isChatLocked = Boolean(data.isChatLocked);
+      if (data.slowModeSeconds !== undefined) {
+        const sm = Number(data.slowModeSeconds);
+        if (Number.isFinite(sm)) {
+          curSettings.slowModeSeconds = Math.max(0, Math.min(3600, Math.round(sm)));
+        }
+      }
+      if (data.isVoiceLocked !== undefined) curSettings.isVoiceLocked = Boolean(data.isVoiceLocked);
       if (data.showDeletedNotice !== undefined && admin && (isSupremeHassan(admin) || admin.role === 'admin' || admin.role === 'super')) {
         curSettings.showDeletedNotice = Boolean(data.showDeletedNotice);
       }
       if (data.pinnedTopic !== undefined) {
-        curSettings.pinnedTopic = sanitizeText(data.pinnedTopic);
+        curSettings.pinnedTopic = sanitizeText(data.pinnedTopic).slice(0, 300);
         io.to(canonicalRoomId).emit('pinnedTopic', curSettings.pinnedTopic);
       }
-      if (data.welcomeMessage !== undefined) curSettings.welcomeMessage = sanitizeText(data.welcomeMessage);
+      if (data.welcomeMessage !== undefined) curSettings.welcomeMessage = sanitizeText(data.welcomeMessage).slice(0, 500);
       if (data.welcomeEnabled !== undefined) curSettings.welcomeEnabled = Boolean(data.welcomeEnabled);
-      if (data.wallpaper !== undefined) curSettings.wallpaper = data.wallpaper;
+      if (data.wallpaper !== undefined) {
+        const rawWall = String(data.wallpaper || '').trim();
+        if (!rawWall) {
+          curSettings.wallpaper = '';
+        } else {
+          const safeWall = (rawWall.startsWith('http') || rawWall.startsWith('/') || rawWall.startsWith('data:'))
+            ? sanitizeUrl(rawWall)
+            : sanitizeCssValue(rawWall);
+          if (safeWall !== undefined && safeWall !== '') {
+            curSettings.wallpaper = safeWall;
+          }
+        }
+      }
       saveRoomSettings();
       io.to(canonicalRoomId).emit('roomSettingsUpdated', { room: canonicalRoomId, settings: curSettings });
     }
@@ -12648,13 +12715,14 @@ io.on('connection', (socket) => {
   // User Profile Settings Updates (حفظ وتعديل الملف الشخصي واستدامته - الاسم الأصلي لا يتغير، يتم تعديل الزخرفة فقط)
   socket.on(
     'updateProfile',
-    ({
+    async ({
       username,
       displayName,
       statusQuote,
       avatarUrl,
       nameBannerUrl,
       password,
+      currentPassword,
       flag,
       nameColor,
       textColor,
@@ -12666,6 +12734,7 @@ io.on('connection', (socket) => {
       avatarUrl?: string;
       nameBannerUrl?: string;
       password?: string;
+      currentPassword?: string;
       flag?: string;
       nameColor?: string;
       textColor?: string;
@@ -12678,7 +12747,7 @@ io.on('connection', (socket) => {
       // Any name edited inside Settings (`الزخرفة واسم العرض`) updates `displayName` only!
       const incomingDecoration = displayName !== undefined ? displayName : username;
       if (incomingDecoration !== undefined) {
-        const cleanDecoration = sanitizeText(String(incomingDecoration).trim());
+        const cleanDecoration = sanitizeText(String(incomingDecoration).trim()).slice(0, 40);
         const nextDisplayName = cleanDecoration || user.username;
         user.displayName = nextDisplayName;
         if (user.sessionToken && activeSessions.has(user.sessionToken)) {
@@ -12689,14 +12758,22 @@ io.on('connection', (socket) => {
 
       // العلم الحقيقي مشفر تلقائيًا عند الدخول ومقفل لمنع اختيار أعلام وهمية
       // user.flag is preserved from real country IP detection
-      if (statusQuote !== undefined) user.statusQuote = sanitizeText(statusQuote);
+      if (statusQuote !== undefined) user.statusQuote = sanitizeText(statusQuote).slice(0, 150);
       if (avatarUrl !== undefined) {
-        const cleanAvatar = sanitizeUrl(avatarUrl);
-        if (cleanAvatar || avatarUrl === '') user.avatarUrl = cleanAvatar || undefined;
+        if (avatarUrl === '') {
+          user.avatarUrl = undefined;
+        } else {
+          const cleanAvatar = await ensureMediaUrlNotBase64(avatarUrl);
+          if (cleanAvatar) user.avatarUrl = cleanAvatar;
+        }
       }
-      if (nameBannerUrl !== undefined) {
-        const cleanBanner = sanitizeUrl(nameBannerUrl);
-        user.nameBannerUrl = cleanBanner || undefined;
+      if (nameBannerUrl !== undefined && (isSupremeHassan(user) || user.role === 'admin' || user.role === 'super' || hasPermission(user.role, 'canAssignBanner') || getRoleLevel(user.role) >= 75)) {
+        if (nameBannerUrl === '') {
+          user.nameBannerUrl = undefined;
+        } else {
+          const cleanBanner = await ensureMediaUrlNotBase64(nameBannerUrl);
+          if (cleanBanner) user.nameBannerUrl = cleanBanner;
+        }
       }
       if (nameColor !== undefined) {
         const safeNC = sanitizeCssColor(nameColor);
@@ -12711,28 +12788,44 @@ io.on('connection', (socket) => {
       // Update registered members persistent store without permitting guest -> member self-promotion
       const currentRegFound = getRegisteredMember(user.username);
       if (currentRegFound) {
-        if (password && String(password).trim().length >= 3 && currentRegFound.member.role !== 'guest') {
-          currentRegFound.member.password = hashPassword(String(password).trim());
-          const oldToken = user.sessionToken;
-          const nextVer = bumpMemberTokenVersion(user.username);
-          const refreshedToken = signSessionToken(user.username, nextVer);
-          user.sessionToken = refreshedToken;
-          revokeUserSessionTokens({
-            sessionToken: oldToken,
-            username: user.username,
-            bumpVersion: false,
-            excludeToken: refreshedToken
-          });
-          activeSessions.set(refreshedToken, {
-            sessionToken: refreshedToken,
-            user,
-            currentSocketId: socket.id,
-            lastActiveTime: Date.now(),
-            isExplicitlyLoggedOut: false,
-            tokenVersion: nextVer
-          });
-          usernameToSessionMap.set(user.username.toLowerCase(), refreshedToken);
-          socket.emit('sessionTokenRefreshed', { sessionToken: refreshedToken });
+        if (password !== undefined) {
+          const trimmedPw = String(password).trim();
+          if (currentRegFound.member.role === 'guest') {
+            socket.emit('systemAlert', 'الزوار لا يملكون كلمة مرور.');
+          } else if (trimmedPw.length < 3 || trimmedPw.length > 128) {
+            socket.emit('systemAlert', 'يجب أن تتراوح كلمة المرور بين 3 و 128 حرفاً.');
+          } else if (
+            currentPassword !== undefined &&
+            currentRegFound.member.password &&
+            !verifyPassword(String(currentPassword).trim(), currentRegFound.member.password)
+          ) {
+            socket.emit('systemAlert', 'كلمة المرور الحالية غير صحيحة.');
+          } else if (!checkHttpRateLimit('pwChange', user.username.toLowerCase(), 3, 10 * 60_000)) {
+            socket.emit('systemAlert', '⏳ تم تغيير كلمة المرور عدة مرات مؤخراً، يرجى الانتظار قليلاً.');
+          } else {
+            currentRegFound.member.password = hashPassword(trimmedPw);
+            const oldToken = user.sessionToken;
+            const nextVer = bumpMemberTokenVersion(user.username);
+            const refreshedToken = signSessionToken(user.username, nextVer);
+            user.sessionToken = refreshedToken;
+            revokeUserSessionTokens({
+              sessionToken: oldToken,
+              username: user.username,
+              bumpVersion: false,
+              excludeToken: refreshedToken
+            });
+            activeSessions.set(refreshedToken, {
+              sessionToken: refreshedToken,
+              user,
+              currentSocketId: socket.id,
+              lastActiveTime: Date.now(),
+              isExplicitlyLoggedOut: false,
+              tokenVersion: nextVer
+            });
+            usernameToSessionMap.set(user.username.toLowerCase(), refreshedToken);
+            socket.emit('sessionTokenRefreshed', { sessionToken: refreshedToken });
+            logMonitorEvent('security', `قام العضو [${user.username}] بتحديث كلمة المرور الخاصة بحسابه.`, user.username);
+          }
         }
         if (incomingDecoration !== undefined) {
           currentRegFound.member.displayName = user.displayName || user.username;
@@ -13068,16 +13161,32 @@ io.on('connection', (socket) => {
   // Add Comment on Wall Post (التعليق على منشورات الحائط مع توسيع الاختصارات)
   socket.on('addWallComment', ({ postId, text }: { postId: string; text: string }) => {
     const user = users.find((u) => u.id === socket.id);
-    if (!user || !text.trim()) return;
+    if (!user || typeof text !== 'string' || !text.trim()) return;
     if (user.isJailed || user.isTextMuted) {
       socket.emit('systemAlert', 'أنت خاضع للإسكات أو التقييد الإداري حالياً.');
       return;
     }
+    if (!isSupremeHassan(user) && user.role !== 'admin' && user.role !== 'super' && !hasPermission(user.role, 'canPostWall')) {
+      socket.emit('systemAlert', 'عفواً، صلاحية التعليق في الحائط غير متاحة لرتبتك الحالية.');
+      return;
+    }
+    if (!checkHttpRateLimit('wallComment', user.username.toLowerCase(), 10, 60_000)) {
+      socket.emit('systemAlert', '⏳ يرجى التمهل قليلاً قبل إضافة تعليق جديد.');
+      return;
+    }
+    const cleanCommentInput = sanitizeText(text).slice(0, 500);
+    if (!cleanCommentInput) return;
+    if (serverSecurity.blockExternalLinks && !isSupremeHassan(user) && user.role !== 'admin' && user.role !== 'super') {
+      if (/(https?:\/\/|www\.|\.com|\.net|\.org|\.xyz|\.app|\.me|\.online|t\.me|wa\.me)/i.test(cleanCommentInput)) {
+        socket.emit('systemAlert', '⚠️ نشر الروابط والإعلانات الخارجية ممنوع منعاً باتاً في شات حسان برو.');
+        return;
+      }
+    }
     const post = wallPosts.find((p) => p.id === postId);
     if (post) {
-      checkAndLogMonitoredWords(text, user, { type: 'wall_comment', targetName: `تعليق على منشور ${post.username}` });
+      checkAndLogMonitoredWords(cleanCommentInput, user, { type: 'wall_comment', targetName: `تعليق على منشور ${post.username}` });
 
-      const expandedCommentText = text ? expandShortcuts(sanitizeText(text)) : '';
+      const expandedCommentText = expandShortcuts(cleanCommentInput).slice(0, 600);
       if (!post.comments) post.comments = [];
       const newComment: WallComment = {
         id: `cm-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -13314,9 +13423,26 @@ io.on('connection', (socket) => {
 
   socket.on('addStoryComment', ({ storyId, text }: { storyId: string; text: string }) => {
     const user = users.find((u) => u.id === socket.id);
-    if (!user || !text?.trim() || user.isJailed || user.isTextMuted) return;
+    if (!user || typeof text !== 'string' || !text.trim() || user.isJailed || user.isTextMuted) return;
+    if (!isSupremeHassan(user) && user.role !== 'admin' && user.role !== 'super' && !hasPermission(user.role, 'canPostWall')) {
+      socket.emit('systemAlert', 'عفواً، صلاحية التعليق غير متاحة لرتبتك الحالية.');
+      return;
+    }
+    if (!checkHttpRateLimit('storyComment', user.username.toLowerCase(), 10, 60_000)) {
+      socket.emit('systemAlert', '⏳ يرجى التمهل قليلاً قبل إضافة تعليق جديد.');
+      return;
+    }
+    const cleanComment = sanitizeText(text).slice(0, 400);
+    if (!cleanComment) return;
+    if (serverSecurity.blockExternalLinks && !isSupremeHassan(user) && user.role !== 'admin' && user.role !== 'super') {
+      if (/(https?:\/\/|www\.|\.com|\.net|\.org|\.xyz|\.app|\.me|\.online|t\.me|wa\.me)/i.test(cleanComment)) {
+        socket.emit('systemAlert', '⚠️ نشر الروابط والإعلانات الخارجية ممنوع منعاً باتاً في شات حسان برو.');
+        return;
+      }
+    }
     const story = storiesList.find((s) => s.id === storyId);
     if (story) {
+      checkAndLogMonitoredWords(cleanComment, user, { type: 'wall_comment', targetName: `تعليق على خاطرة ${story.username}` });
       if (!story.comments) story.comments = [];
       const newCm: StoryComment = {
         id: `sc-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -13324,11 +13450,14 @@ io.on('connection', (socket) => {
         displayName: user.displayName || user.username,
         avatarUrl: user.avatarUrl,
         nameBannerUrl: user.nameBannerUrl,
-        text: sanitizeText(text),
+        text: cleanComment,
         time: getCurrentTimeString(),
         timestamp: Date.now()
       };
       story.comments.push(newCm);
+      if (story.comments.length > 50) {
+        story.comments = story.comments.slice(-50);
+      }
       saveStories();
       io.emit('storiesUpdated', getActiveStories());
       socket.emit('systemAlert', 'تمت إضافة تعليقك على الخاطرة بنجاح 💬');
@@ -13587,33 +13716,50 @@ io.on('connection', (socket) => {
     socket.emit('systemAlert', 'تم استلام بلاغك بنجاح وسيقوم المشرفون بمراجعته فوراً 🛡️');
   });
 
-  // Add Points Reward from Games & Activities (with anti-abuse cooldown)
+  // Add Points Reward from Games & Activities (strict anti-abuse cooldown + hourly cap)
   socket.on('addPointsReward', ({ amount, reason }: { amount: number; reason: string }) => {
     const user = users.find((u) => u.id === socket.id);
-    if (!user) return;
+    if (!user || user.isJailed || user.isTextMuted) return;
+    if (user.role === 'guest') {
+      return;
+    }
     const now = Date.now();
-    const lastRewardAt = ((user as any)._lastPointsRewardAt as number) || 0;
-    if (now - lastRewardAt < 10000) {
+    const uKey = user.username.toLowerCase();
+    if (!checkHttpRateLimit('gameRewardCooldown', uKey, 1, 15_000)) {
       return;
     }
     const parsedAmount = Number(amount);
     if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) return;
-    (user as any)._lastPointsRewardAt = now;
-    const pointsToAdd = Math.min(Math.max(1, Math.floor(parsedAmount)), 100);
+    const requestedPoints = Math.min(Math.max(1, Math.floor(parsedAmount)), 100);
+
+    let bucket = hourlyPointsRewardMap.get(uKey);
+    if (!bucket || bucket.resetAt <= now) {
+      bucket = { total: 0, resetAt: now + 3600_000 };
+    }
+    const remainingHourly = Math.max(0, 300 - bucket.total);
+    if (remainingHourly <= 0) {
+      socket.emit('systemAlert', 'وصلت للحد الأقصى لمكافآت الألعاب هذه الساعة (300 نقطة).');
+      return;
+    }
+    const pointsToAdd = Math.min(requestedPoints, remainingHourly);
+    bucket.total += pointsToAdd;
+    hourlyPointsRewardMap.set(uKey, bucket);
+
     user.points = (user.points || 0) + pointsToAdd;
     const regMember = getRegisteredMember(user.username)?.member;
     if (regMember) {
       regMember.points = user.points;
       saveMembers();
     }
-    socket.emit('userPointsUpdated', { points: user.points, reason: sanitizeText(reason) || 'مكافأة', added: pointsToAdd });
+    socket.emit('userPointsUpdated', { points: user.points, reason: sanitizeText(reason).slice(0, 80) || 'مكافأة', added: pointsToAdd });
   });
 
   // Authoritative Daily Login Streak Claim (persistent server-side verification)
   socket.on('claimDailyLoginReward', () => {
     const user = users.find((u) => u.id === socket.id);
-    if (!user) return;
+    if (!user || user.role === 'guest') return;
     const reg = getRegisteredMember(user.username)?.member as any;
+    if (!reg) return;
     const todayStr = new Date().toISOString().slice(0, 10);
     const lastDate = reg?.lastDailyRewardDate || '';
     if (lastDate === todayStr) {
@@ -13635,12 +13781,10 @@ io.on('connection', (socket) => {
     }
     const rewardPoints = 25 + nextStreak * 15;
     user.points = (user.points || 0) + rewardPoints;
-    if (reg) {
-      reg.points = user.points;
-      reg.dailyStreak = nextStreak;
-      reg.lastDailyRewardDate = todayStr;
-      saveMembers();
-    }
+    reg.points = user.points;
+    reg.dailyStreak = nextStreak;
+    reg.lastDailyRewardDate = todayStr;
+    saveMembers();
     socket.emit('userPointsUpdated', { points: user.points, reason: `مكافأة الدخول اليومي (يوم ${nextStreak})`, added: rewardPoints });
     socket.emit('dailyRewardResult', {
       ok: true,
@@ -13656,6 +13800,10 @@ io.on('connection', (socket) => {
   socket.on('transferPoints', ({ targetUsername, amount }: { targetUsername: string; amount: number }) => {
     const sender = users.find((u) => u.id === socket.id);
     if (!sender) return;
+    if (sender.role === 'guest' || sender.isJailed) {
+      socket.emit('systemAlert', 'تحويل النقاط متاح للأعضاء المسجلين فقط.');
+      return;
+    }
     const now = Date.now();
     const lastTxAt = ((sender as any)._lastPointsTransferAt as number) || 0;
     if (now - lastTxAt < 4000) {
@@ -13679,8 +13827,8 @@ io.on('connection', (socket) => {
 
     const targetOnline = users.find((u) => u.username.toLowerCase() === cleanTarget.toLowerCase());
     const regTarget = getRegisteredMember(cleanTarget);
-    if (!targetOnline && !regTarget) {
-      socket.emit('systemAlert', `العضو [${cleanTarget}] غير موجود.`);
+    if (!regTarget || regTarget.member.role === 'guest') {
+      socket.emit('systemAlert', `العضو [${cleanTarget}] غير مسجل أو غير موجود.`);
       return;
     }
 
@@ -13689,15 +13837,11 @@ io.on('connection', (socket) => {
     const regSender = getRegisteredMember(sender.username)?.member;
     if (regSender) regSender.points = sender.points;
 
-    const resolvedTargetName = regTarget?.key || targetOnline?.username || cleanTarget;
-    let newTargetPoints = parsedAmount;
-    if (regTarget) {
-      regTarget.member.points = (regTarget.member.points || 0) + parsedAmount;
-      newTargetPoints = regTarget.member.points;
-    }
+    const resolvedTargetName = regTarget.key;
+    regTarget.member.points = (regTarget.member.points || 0) + parsedAmount;
+    const newTargetPoints = regTarget.member.points;
     if (targetOnline) {
-      targetOnline.points = regTarget ? newTargetPoints : ((targetOnline.points || 0) + parsedAmount);
-      newTargetPoints = targetOnline.points;
+      targetOnline.points = newTargetPoints;
       io.to(targetOnline.id).emit('userPointsUpdated', {
         points: targetOnline.points,
         reason: `تحويل نقاط من ${sender.username}`,
@@ -13718,11 +13862,10 @@ io.on('connection', (socket) => {
   // Broadcast Mini-Game Win to Room (with anti-spam cooldown)
   socket.on('broadcastGameWin', ({ gameName, pointsWon }: { gameName: string; pointsWon: number }) => {
     const user = users.find((u) => u.id === socket.id);
-    if (!user) return;
+    if (!user || user.isJailed || user.isTextMuted || !user.room || user.room === 'خارج الغرف') return;
     const now = Date.now();
-    const lastWinAt = ((user as any)._lastGameWinBroadcastAt as number) || 0;
-    if (now - lastWinAt < 5000) return;
-    (user as any)._lastGameWinBroadcastAt = now;
+    if (!checkHttpRateLimit('gameWinCooldown', user.username.toLowerCase(), 1, 15_000)) return;
+    const cleanGameName = sanitizeText(gameName).slice(0, 60) || 'لعبة المسابقات';
     const clampedPoints = Math.min(Math.max(1, Math.floor(Number(pointsWon) || 1)), 100);
     const winMsg: StoredMessage = {
       id: `gamewin-${now}`,
@@ -13730,7 +13873,7 @@ io.on('connection', (socket) => {
       username: 'نظام الجوائز والمسابقات 🏆',
       badge: 'فوز مستحق',
       badgeColor: 'text-amber-500',
-      text: `🎉 كفو! حقق الصقر [${user.username}] فوزاً في (${sanitizeText(gameName)}) وحصد [${clampedPoints} نقطة] إضافية!`,
+      text: `🎉 كفو! حقق الصقر [${user.username}] فوزاً في (${cleanGameName}) وحصد [${clampedPoints} نقطة] إضافية!`,
       time: getCurrentTimeString(),
       timestamp: now
     };
@@ -14141,7 +14284,19 @@ io.on('connection', (socket) => {
     if (!user) return;
     const reg = getRegisteredMember(user.username)?.member;
     if (reg && Array.isArray(starredMessages)) {
-      reg.starredMessages = starredMessages.filter((m) => m && typeof m === 'object').slice(0, 100);
+      reg.starredMessages = starredMessages
+        .filter((m) => m && typeof m === 'object')
+        .slice(0, 100)
+        .map((m) => ({
+          id: sanitizeText(String(m.id || '')).slice(0, 80),
+          username: sanitizeText(String(m.username || '')).slice(0, 64),
+          ...(typeof m.displayName === 'string' && m.displayName.trim()
+            ? { displayName: sanitizeText(m.displayName).slice(0, 64) }
+            : {}),
+          text: sanitizeText(String(m.text || '')).slice(0, 500),
+          time: sanitizeText(String(m.time || '')).slice(0, 40)
+        }))
+        .filter((m) => Boolean(m.id && m.username));
       saveMembers();
     }
   });
