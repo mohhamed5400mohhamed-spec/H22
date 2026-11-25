@@ -15,3 +15,4 @@ global_appearance.json
 roles_config.json
 shortcuts.json
 uploads/
+session_signing_secret.json

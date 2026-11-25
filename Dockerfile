@@ -22,7 +22,7 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/server.ts ./server.ts
 COPY --from=builder /app/server ./server
-COPY --from=builder /app/bot*.js /app/*.json ./
+COPY --from=builder /app/bot*.js /app/bots.json /app/bot_settings.json /app/botReplies.json /app/chat_quality_settings.json /app/flag_counters.json /app/message_retention_limits.json /app/monitored_words.json /app/metadata.json ./
 
 RUN chown -R node:node /app
 USER node

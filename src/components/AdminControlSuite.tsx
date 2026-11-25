@@ -426,7 +426,7 @@ export const AdminControlSuite: React.FC<AdminControlSuiteProps> = ({
   // Member View Mode: Live in current room vs All registered/login accounts vs Active Sessions
   const [memberViewMode, setMemberViewMode] = useState<'roomLive' | 'registeredAll' | 'activeSessions'>('roomLive');
   const [activeSessions, setActiveSessions] = useState<Array<{
-    sessionToken: string;
+    sessionId: string;
     username: string;
     role: string;
     room: string;
@@ -1277,7 +1277,7 @@ export const AdminControlSuite: React.FC<AdminControlSuiteProps> = ({
                   const roleBadge = getRoleBadge(sess.role);
                   return (
                     <div
-                      key={sess.sessionToken}
+                      key={sess.sessionId || `${sess.username}-${sess.lastActive}`}
                       className="p-3 rounded-xl border bg-slate-800/90 border-slate-700 hover:border-indigo-500/60 transition-all space-y-2"
                     >
                       <div className="flex items-center justify-between gap-2">
@@ -1309,7 +1309,7 @@ export const AdminControlSuite: React.FC<AdminControlSuiteProps> = ({
                                 'إنهاء وإسقاط الجلسة',
                                 `هل أنت متأكد من إنهاء وإسقاط جلسة [${sess.username}] وطرده فوراً؟`,
                                 () => {
-                                  socket?.emit('terminateSession', { sessionToken: sess.sessionToken });
+                                  socket?.emit('terminateSession', { sessionId: sess.sessionId });
                                 }
                               );
                             }}

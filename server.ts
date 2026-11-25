@@ -9,7 +9,7 @@ import zlib from 'zlib';
 import { fileURLToPath } from 'url';
 import bcrypt from 'bcryptjs';
 import { dataManager } from './server/data/dataAdapter.ts';
-import { storageManager } from './server/storage/storageAdapter.ts';
+import { storageManager, validateMediaMagicBytes } from './server/storage/storageAdapter.ts';
 import {
   DEFAULT_EMBLEMS,
   DEFAULT_FALCON_CHAT_BANNER,
@@ -63,9 +63,9 @@ function isOriginAllowed(origin: string | undefined, hostHeader?: string): boole
     if (hostHeader) {
       const candidateHosts = hostHeader
         .split(',')
-        .map((h) => h.trim())
+        .map((h) => h.trim().toLowerCase())
         .filter(Boolean);
-      if (candidateHosts.includes(parsed.host)) return true;
+      if (candidateHosts.includes(parsed.host.toLowerCase())) return true;
     }
     if (process.env.NODE_ENV !== 'production') return true;
   } catch {
@@ -245,11 +245,48 @@ app.get('/api/ice-servers', (_req, res) => {
   res.status(200).json({ iceServers });
 });
 
+const httpRateLimitMap = new Map<string, { count: number; resetAt: number }>();
+function checkHttpRateLimit(bucket: string, key: string, maxRequests: number, windowMs: number): boolean {
+  const now = Date.now();
+  const composite = `${bucket}:${key}`;
+  const entry = httpRateLimitMap.get(composite);
+  if (entry && entry.resetAt > now) {
+    if (entry.count >= maxRequests) return false;
+    entry.count += 1;
+    return true;
+  }
+  if (httpRateLimitMap.size >= 5000) {
+    for (const [k, v] of httpRateLimitMap.entries()) {
+      if (v.resetAt <= now) httpRateLimitMap.delete(k);
+    }
+  }
+  httpRateLimitMap.set(composite, { count: 1, resetAt: now + windowMs });
+  return true;
+}
+
+function getRequestClientIp(req: express.Request): string {
+  const cfRay = Boolean(req.headers['cf-ray']);
+  return ((cfRay ? (req.headers['cf-connecting-ip'] as string) : undefined) || req.ip || 'unknown').trim();
+}
+
+function resolveVerifiedHttpSession(token: string, expectedUsername?: string): UserSession | null {
+  if (!token || typeof token !== 'string') return null;
+  const sess = activeSessions.get(token);
+  if (!sess || sess.isExplicitlyLoggedOut || !sess.user?.username) return null;
+  if (expectedUsername && sess.user.username.toLowerCase() !== expectedUsername.trim().toLowerCase()) {
+    return null;
+  }
+  if (bannedUsers.has(sess.user.username.toLowerCase())) return null;
+  const verified = verifySignedSessionTokenPayload(token, sess.user.username);
+  if (!verified) return null;
+  return sess;
+}
+
 // Storage & Database Health / Status Endpoint
 app.get('/api/system/storage-status', (req, res) => {
   const token = extractUploadSessionToken(req);
-  const sess = token ? activeSessions.get(token) : undefined;
-  const isAuthorizedStaff = Boolean(sess && !sess.isExplicitlyLoggedOut && isStaffUser(sess.user));
+  const sess = resolveVerifiedHttpSession(token);
+  const isAuthorizedStaff = Boolean(sess && isStaffUser(sess.user));
   const dataStatus = dataManager.getStatus();
 
   if (!isAuthorizedStaff) {
@@ -285,8 +322,8 @@ app.get('/api/admin/verify-session', (req, res) => {
   if (!token) {
     return res.status(401).json({ ok: false, authorized: false, reason: 'missing_token' });
   }
-  const sess = activeSessions.get(token);
-  if (!sess || sess.isExplicitlyLoggedOut) {
+  const sess = resolveVerifiedHttpSession(token);
+  if (!sess) {
     return res.status(401).json({ ok: false, authorized: false, reason: 'invalid_session' });
   }
   const authorized = isStaffUser(sess.user);
@@ -299,6 +336,64 @@ app.get('/api/admin/verify-session', (req, res) => {
     username: sess.user.username,
     role: sess.user.role
   });
+});
+
+// First-run Supreme Admin Bootstrap Status & One-Time Claim Endpoints
+app.get('/api/auth/admin-bootstrap-status', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({ ok: true, needsAdminSetup: isAdminClaimRequired() });
+});
+
+app.post('/api/auth/claim-admin', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const reqIp = getRequestClientIp(req);
+  if (!checkHttpRateLimit('claim-admin', reqIp, 5, 15 * 60_000)) {
+    return res.status(429).json({
+      ok: false,
+      error: 'تم تجاوز عدد محاولات التهيئة المسموح بها، يرجى الانتظار 15 دقيقة.'
+    });
+  }
+  if (!isAdminClaimRequired()) {
+    return res.status(403).json({
+      ok: false,
+      error: 'تم تعيين كلمة مرور الإدارة العليا مسبقاً أو تم ضبطها عبر متغيرات البيئة.'
+    });
+  }
+  const rawPassword = typeof req.body?.password === 'string' ? req.body.password.trim() : '';
+  if (rawPassword.length < 6) {
+    return res.status(400).json({
+      ok: false,
+      error: 'يجب أن تتكون كلمة مرور الإدارة العليا من 6 أحرف أو أرقام على الأقل.'
+    });
+  }
+  if (rawPassword === '123456' || rawPassword === 'password' || rawPassword === 'admin123') {
+    return res.status(400).json({
+      ok: false,
+      error: 'يرجى اختيار كلمة مرور أقوى وغير شائعة لحماية حساب الإدارة العليا.'
+    });
+  }
+
+  if (!registeredMembers['admin']) {
+    registeredMembers['admin'] = {
+      password: '',
+      role: 'hassan',
+      flag: '👑',
+      statusQuote: 'مدير عام شات حسان برو 🦅',
+      avatarUrl: '',
+      likes: 10000,
+      points: 2000000,
+      honorBadge: '👑 المدير التنفيذي',
+      nameBannerUrl: '',
+      giftBadges: [],
+      tokenVersion: 1
+    };
+  }
+  registeredMembers['admin'].role = 'hassan';
+  registeredMembers['admin'].password = hashPassword(rawPassword);
+  registeredMembers['admin'].tokenVersion = Math.max(1, registeredMembers['admin'].tokenVersion || 1) + 1;
+  saveMembers();
+  io.emit('adminBootstrapStatus', { needsAdminSetup: false });
+  return res.json({ ok: true });
 });
 
 const ytSearchRateLimitMap = new Map<string, { count: number; resetAt: number }>();
@@ -516,18 +611,23 @@ function extractUploadSessionToken(req: express.Request): string {
   return (headerToken || bearer).trim();
 }
 
-function isUploadAuthorized(req: express.Request): boolean {
+function getAuthorizedUploadSession(req: express.Request): UserSession | null {
   const token = extractUploadSessionToken(req);
-  if (!token) return false;
-  const sess = activeSessions.get(token);
-  return Boolean(sess && !sess.isExplicitlyLoggedOut);
+  const sess = resolveVerifiedHttpSession(token);
+  if (!sess || sess.user.isJailed) return null;
+  return sess;
 }
 
 // HTTP Media Upload Endpoint: Bypasses WebSocket frames to prevent socket freeze/disconnect
 app.post('/api/upload-media-binary', async (req, res) => {
   try {
-    if (!isUploadAuthorized(req)) {
+    const uploadSess = getAuthorizedUploadSession(req);
+    if (!uploadSess) {
       return res.status(401).json({ success: false, error: 'يجب تسجيل الدخول أولاً لرفع الملفات.' });
+    }
+    const reqKey = `${getRequestClientIp(req)}:${uploadSess.user.username.toLowerCase()}`;
+    if (!checkHttpRateLimit('upload-media', reqKey, 25, 60_000)) {
+      return res.status(429).json({ success: false, error: 'تم تجاوز الحد المسموح لرفع الملفات، يرجى الانتظار دقيقة.' });
     }
     let rawFilename = 'file';
     try {
@@ -547,7 +647,8 @@ app.post('/api/upload-media-binary', async (req, res) => {
 
     const uploadResult = await storageManager.saveStream(req, rawFilename, mime);
     if (!uploadResult.success || !uploadResult.url) {
-      return res.status(500).json({
+      const isBadMedia = typeof uploadResult.error === 'string' && (uploadResult.error.includes('غير مسموح') || uploadResult.error.includes('لا يتطابق'));
+      return res.status(isBadMedia ? 400 : 500).json({
         success: false,
         error: uploadResult.error || 'فشل حفظ الملف على الخادم أو التخزين السحابي'
       });
@@ -564,7 +665,8 @@ app.post('/api/upload-media-binary', async (req, res) => {
   } catch (err: any) {
     console.error('Error in binary upload:', err);
     const isTooLarge = typeof err?.message === 'string' && err.message.includes('يتجاوز الحد الأقصى');
-    return res.status(isTooLarge ? 413 : 500).json({
+    const isInvalidType = typeof err?.message === 'string' && (err.message.includes('غير مسموح') || err.message.includes('لا يتطابق'));
+    return res.status(isTooLarge ? 413 : isInvalidType ? 400 : 500).json({
       success: false,
       error: err?.message || 'فشل حفظ الملف على الخادم أو التخزين السحابي'
     });
@@ -573,12 +675,20 @@ app.post('/api/upload-media-binary', async (req, res) => {
 
 app.post('/api/upload-media', express.json({ limit: '50mb' }), async (req, res) => {
   try {
-    if (!isUploadAuthorized(req)) {
+    const uploadSess = getAuthorizedUploadSession(req);
+    if (!uploadSess) {
       return res.status(401).json({ success: false, error: 'يجب تسجيل الدخول أولاً لرفع الملفات.' });
+    }
+    const reqKey = `${getRequestClientIp(req)}:${uploadSess.user.username.toLowerCase()}`;
+    if (!checkHttpRateLimit('upload-media', reqKey, 25, 60_000)) {
+      return res.status(429).json({ success: false, error: 'تم تجاوز الحد المسموح لرفع الملفات، يرجى الانتظار دقيقة.' });
     }
     const { dataUrl, filename, mediaType } = req.body || {};
     if (!dataUrl || typeof dataUrl !== 'string') {
       return res.status(400).json({ success: false, error: 'بيانات الملف مفقودة' });
+    }
+    if (dataUrl.length > 70 * 1024 * 1024) {
+      return res.status(413).json({ success: false, error: 'حجم الملف يتجاوز 50 ميجابايت.' });
     }
 
     const matches = dataUrl.match(/^data:([A-Za-z0-9-+\/]+)(?:;[^,]*)?;base64,(.+)$/);
@@ -587,9 +697,7 @@ app.post('/api/upload-media', express.json({ limit: '50mb' }), async (req, res) 
     }
 
     const mime = matches[1].toLowerCase();
-    const buffer = Buffer.from(matches[2], 'base64');
-
-    const originalFilename = filename || `file_${Date.now()}`;
+    const originalFilename = typeof filename === 'string' && filename.trim() ? filename.trim().slice(0, 120) : `file_${Date.now()}`;
     if (
       mime.includes('svg') ||
       mime.includes('html') ||
@@ -598,8 +706,12 @@ app.post('/api/upload-media', express.json({ limit: '50mb' }), async (req, res) 
     ) {
       return res.status(400).json({ success: false, error: 'صيغة الملف غير مسموح برفعها لأسباب أمنية.' });
     }
+    const buffer = Buffer.from(matches[2], 'base64');
     if (buffer.length > 50 * 1024 * 1024) {
       return res.status(413).json({ success: false, error: 'حجم الملف يتجاوز 50 ميجابايت.' });
+    }
+    if (!validateMediaMagicBytes(buffer)) {
+      return res.status(400).json({ success: false, error: 'محتوى الملف لا يتطابق مع صيغة وسائط صالحة.' });
     }
 
     const uploadResult = await storageManager.saveBuffer(buffer, originalFilename, mime);
@@ -614,7 +726,8 @@ app.post('/api/upload-media', express.json({ limit: '50mb' }), async (req, res) 
     });
   } catch (err: any) {
     console.error('Error saving uploaded media:', err);
-    return res.status(500).json({ success: false, error: 'فشل حفظ الملف على الخادم أو التخزين السحابي' });
+    const isBadMedia = typeof err?.message === 'string' && (err.message.includes('غير مسموح') || err.message.includes('لا يتطابق'));
+    return res.status(isBadMedia ? 400 : 500).json({ success: false, error: isBadMedia ? err.message : 'فشل حفظ الملف على الخادم أو التخزين السحابي' });
   }
 });
 
@@ -631,6 +744,7 @@ export async function ensureMediaUrlNotBase64(url: string | undefined): Promise<
   }
 
   try {
+    if (url.length > 70 * 1024 * 1024) return undefined;
     const matches = url.match(/^data:([A-Za-z0-9-+\/;=,\s]+);base64,(.+)$/);
     if (!matches || matches.length !== 3) return undefined;
 
@@ -640,7 +754,7 @@ export async function ensureMediaUrlNotBase64(url: string | undefined): Promise<
     }
     const base64Data = matches[2];
     const buffer = Buffer.from(base64Data, 'base64');
-    if (!buffer || buffer.length === 0) return undefined;
+    if (!buffer || buffer.length === 0 || buffer.length > 50 * 1024 * 1024) return undefined;
 
     let ext = '';
     if (mime.includes('png')) ext = 'png';
@@ -654,6 +768,7 @@ export async function ensureMediaUrlNotBase64(url: string | undefined): Promise<
     else if (mime.includes('ogg') || mime.includes('audio') || mime.includes('wav')) ext = 'wav';
 
     if (!ext) return undefined;
+    if (!validateMediaMagicBytes(buffer, ext)) return undefined;
 
     const filename = `media_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.${ext}`;
 
@@ -973,6 +1088,7 @@ export interface UserSession {
   currentSocketId: string;
   lastActiveTime: number;
   isExplicitlyLoggedOut: boolean;
+  tokenVersion?: number;
 }
 
 export interface RecentLoginEntry {
@@ -1103,27 +1219,92 @@ function getRecentLogins(): RecentLoginEntry[] {
 
 const activeSessions = new Map<string, UserSession>(); // key: sessionToken
 const usernameToSessionMap = new Map<string, string>(); // key: username.toLowerCase() -> sessionToken (internal cleanup index only)
+const revokedSessionTokens = new Map<string, number>(); // key: sessionToken -> expiry timestamp
+const revokedUsernameBeforeIat = new Map<string, number>(); // key: username.toLowerCase() -> revocation cutoff ms
 const pendingAwayTimers = new Map<string, NodeJS.Timeout>(); // key: username.toLowerCase() -> 2-min presence away timer
 const pendingMicGraceTimers = new Map<string, NodeJS.Timeout>(); // key: username.toLowerCase() -> mic preservation grace timer
 
-let sessionSigningSecret = (process.env.SESSION_SECRET || '').trim();
+let sessionSigningSecret = (process.env.SESSION_SECRET || process.env.SESSION_SIGNING_SECRET || '').trim();
 if (!sessionSigningSecret) {
-  try {
-    const loadedSecret = dataManager.loadSync<string>('session_signing_secret', '');
-    if (loadedSecret && typeof loadedSecret === 'string' && loadedSecret.length >= 32) {
-      sessionSigningSecret = loadedSecret;
-    } else {
-      sessionSigningSecret = crypto.randomBytes(32).toString('hex');
-      dataManager.save('session_signing_secret', sessionSigningSecret);
+  sessionSigningSecret = crypto.randomBytes(32).toString('hex');
+}
+
+function pruneRevokedTokens() {
+  const now = Date.now();
+  for (const [tok, exp] of revokedSessionTokens.entries()) {
+    if (exp <= now) revokedSessionTokens.delete(tok);
+  }
+  if (revokedSessionTokens.size > 5000) {
+    const excess = revokedSessionTokens.size - 5000;
+    let removed = 0;
+    for (const key of revokedSessionTokens.keys()) {
+      revokedSessionTokens.delete(key);
+      removed += 1;
+      if (removed >= excess) break;
     }
-  } catch {
-    sessionSigningSecret = crypto.randomBytes(32).toString('hex');
   }
 }
 
-function signSessionToken(username: string): string {
+function getMemberTokenVersion(username?: string): number {
+  if (!username) return 1;
+  const reg = getRegisteredMember(username);
+  return Math.max(1, reg?.member.tokenVersion || 1);
+}
+
+function bumpMemberTokenVersion(username?: string): number {
+  if (!username) return 1;
+  const reg = getRegisteredMember(username);
+  if (!reg) return 1;
+  const nextVer = Math.max(1, reg.member.tokenVersion || 1) + 1;
+  reg.member.tokenVersion = nextVer;
+  saveMembers();
+  return nextVer;
+}
+
+function revokeUserSessionTokens(options: {
+  sessionToken?: string;
+  username?: string;
+  bumpVersion?: boolean;
+  excludeToken?: string;
+}) {
+  const { sessionToken, username, bumpVersion = false, excludeToken } = options;
+  pruneRevokedTokens();
+  const expiry = Date.now() + 7 * 24 * 60 * 60 * 1000;
+
+  if (sessionToken && sessionToken !== excludeToken) {
+    const existing = activeSessions.get(sessionToken);
+    if (existing) {
+      existing.isExplicitlyLoggedOut = true;
+      activeSessions.delete(sessionToken);
+    }
+    revokedSessionTokens.set(sessionToken, expiry);
+  }
+
+  if (username) {
+    const lower = username.trim().toLowerCase();
+    for (const [tok, sess] of activeSessions.entries()) {
+      if (tok !== excludeToken && sess.user?.username?.toLowerCase() === lower) {
+        sess.isExplicitlyLoggedOut = true;
+        activeSessions.delete(tok);
+        revokedSessionTokens.set(tok, expiry);
+      }
+    }
+    if (!excludeToken) {
+      usernameToSessionMap.delete(lower);
+    }
+    revokedUsernameBeforeIat.set(lower, Date.now());
+    if (bumpVersion) {
+      bumpMemberTokenVersion(username);
+    }
+  }
+  persistActiveSessions();
+}
+
+function signSessionToken(username: string, tokenVersion?: number): string {
+  const v = typeof tokenVersion === 'number' && tokenVersion >= 1 ? tokenVersion : getMemberTokenVersion(username);
   const payloadObj = {
     u: username.trim().toLowerCase(),
+    v,
     iat: Date.now(),
     n: crypto.randomBytes(8).toString('hex')
   };
@@ -1132,8 +1313,12 @@ function signSessionToken(username: string): string {
   return `tok_${payloadB64}.${sigHex}`;
 }
 
-function verifySignedSessionToken(token: string, expectedUsername?: string): string | null {
+function verifySignedSessionTokenPayload(
+  token: string,
+  expectedUsername?: string
+): { username: string; version: number; iat: number } | null {
   if (!token || typeof token !== 'string' || !token.startsWith('tok_')) return null;
+  if (revokedSessionTokens.has(token)) return null;
   const raw = token.slice(4);
   const dotIdx = raw.indexOf('.');
   if (dotIdx <= 0) return null;
@@ -1145,15 +1330,38 @@ function verifySignedSessionToken(token: string, expectedUsername?: string): str
     const a = Buffer.from(sigHex, 'hex');
     const b = Buffer.from(expectedSig, 'hex');
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
-    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as { u?: string; iat?: number };
+    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as {
+      u?: string;
+      v?: number;
+      iat?: number;
+    };
     if (!parsed?.u || typeof parsed.u !== 'string') return null;
-    if (expectedUsername && parsed.u.toLowerCase() !== expectedUsername.trim().toLowerCase()) {
+    const lowerU = parsed.u.toLowerCase();
+    if (expectedUsername && lowerU !== expectedUsername.trim().toLowerCase()) {
       return null;
     }
-    return parsed.u.toLowerCase();
+    const tokenIat = typeof parsed.iat === 'number' ? parsed.iat : 0;
+    const cutoff = revokedUsernameBeforeIat.get(lowerU);
+    if (cutoff && tokenIat <= cutoff) {
+      return null;
+    }
+    const tokenVer = typeof parsed.v === 'number' && parsed.v >= 1 ? parsed.v : 1;
+    const minVer = getMemberTokenVersion(lowerU);
+    if (tokenVer < minVer) {
+      return null;
+    }
+    return { username: lowerU, version: tokenVer, iat: tokenIat };
   } catch {
     return null;
   }
+}
+
+function verifySignedSessionToken(token: string, expectedUsername?: string): string | null {
+  return verifySignedSessionTokenPayload(token, expectedUsername)?.username || null;
+}
+
+function getOpaqueSessionId(token: string): string {
+  return crypto.createHmac('sha256', sessionSigningSecret).update(`sid:${token}`).digest('hex').slice(0, 24);
 }
 
 // Hydrate existing sessions from Data Layer
@@ -2381,7 +2589,7 @@ function applyPersistentMute(
         by: options.actorName
       });
       if (u.micSlot !== null || u.isVoice) {
-        io.to(u.room).emit('micSlotsUpdated', getMicSlotsForRoom(u.room));
+        io.to(u.room).emit('micSlotsUpdated', getPublicMicSlotsForRoom(u.room));
         io.to(u.room).emit('userVoiceStateChanged', {
           userId: u.id,
           isMuted: u.isMuted,
@@ -2510,7 +2718,7 @@ function clearPersistentMute(
         by: options.actorName
       });
       if (u.micSlot !== null || u.isVoice) {
-        io.to(u.room).emit('micSlotsUpdated', getMicSlotsForRoom(u.room));
+        io.to(u.room).emit('micSlotsUpdated', getPublicMicSlotsForRoom(u.room));
         io.to(u.room).emit('userVoiceStateChanged', {
           userId: u.id,
           isMuted: u.isMuted,
@@ -3670,6 +3878,17 @@ let serverSecurity: ServerSecuritySettings = {
   likeCooldownSeconds: 60
 };
 
+function getPublicServerSecurity(sec: ServerSecuritySettings) {
+  return {
+    marqueeTicker: sec.marqueeTicker,
+    guestsAllowed: sec.guestsAllowed,
+    emergencyLockdown: sec.emergencyLockdown,
+    blockExternalLinks: sec.blockExternalLinks,
+    awayDelaySeconds: sec.awayDelaySeconds,
+    reconnectBannerDelaySeconds: sec.reconnectBannerDelaySeconds
+  };
+}
+
 // Staff Internal Memos & Notice Board
 export interface StaffMemo {
   id: string;
@@ -3900,11 +4119,17 @@ export interface RegisteredMemberInfo {
   ignoredUsers?: string[];
   starredMessages?: Array<{ id: string; username: string; text: string; time: string }>;
   friends?: string[];
+  tokenVersion?: number;
 }
 
+function getEnvAdminPassword(): string {
+  return (process.env.ADMIN_PASSWORD || '').trim();
+}
+
+const initialEnvAdminPass = getEnvAdminPassword();
 const registeredMembers: Record<string, RegisteredMemberInfo> = {
   'admin': {
-    password: hashPassword('123'),
+    password: initialEnvAdminPass ? hashPassword(initialEnvAdminPass) : '',
     role: 'hassan',
     flag: '👑',
     statusQuote: 'مدير عام شات حسان برو 🦅',
@@ -3917,6 +4142,7 @@ const registeredMembers: Record<string, RegisteredMemberInfo> = {
     ipAddress: '127.0.0.1',
     deviceInfo: 'كمبيوتر / هاتف ذكي',
     deviceFingerprint: 'FP-ADMIN-ORIGIN',
+    tokenVersion: 1,
     engagement: {
       activeTimeMinutes: 120,
       messagesSent: 50,
@@ -3927,6 +4153,22 @@ const registeredMembers: Record<string, RegisteredMemberInfo> = {
     }
   }
 };
+
+function syncAdminEnvPassword() {
+  const envPass = getEnvAdminPassword();
+  if (registeredMembers['admin']) {
+    registeredMembers['admin'].role = 'hassan';
+    if (envPass) {
+      registeredMembers['admin'].password = hashPassword(envPass);
+    }
+  }
+}
+
+function isAdminClaimRequired(): boolean {
+  if (getEnvAdminPassword().length > 0) return false;
+  const adminEntry = getRegisteredMember('admin')?.member;
+  return !adminEntry || !adminEntry.password;
+}
 
 // Self-healing O(1) lowercase index for registeredMembers
 const regMemberLowerKeyMap = new Map<string, string>();
@@ -4431,7 +4673,7 @@ export function recordMemberAuditConnection(username: string, clientIp: string, 
   const foundKey = Object.keys(registeredMembers).find((k) => k.toLowerCase() === lower) || clean;
   if (!registeredMembers[foundKey]) {
     registeredMembers[foundKey] = {
-      password: hashPassword('123'),
+      password: hashPassword(crypto.randomBytes(16).toString('hex')),
       originalUsername: clean,
       registeredAt: Date.now(),
       role: 'guest',
@@ -4842,6 +5084,19 @@ function getMicSlotsForRoom(room: string) {
   return roomMicSlots[room];
 }
 
+function getPublicMicSlotsForRoom(room: string) {
+  return getMicSlotsForRoom(room).map((slot) => {
+    if (!slot.user) return { slotNumber: slot.slotNumber, user: null };
+    const liveUser = users.find(
+      (u) => u.id === slot.user!.id || u.username.toLowerCase() === slot.user!.username.toLowerCase()
+    );
+    return {
+      slotNumber: slot.slotNumber,
+      user: toPublicConnectedUser(liveUser || slot.user)
+    };
+  });
+}
+
 function releaseUserMic(user: ConnectedUser, roomId?: string): number | null {
   const targetRoom = roomId || user.room;
   const hadVoice = user.micSlot !== null || user.isVoice;
@@ -4861,7 +5116,7 @@ function releaseUserMic(user: ConnectedUser, roomId?: string): number | null {
       }
     });
     if (hadVoice && targetRoom !== 'خارج الغرف') {
-      io.to(targetRoom).emit('micSlotsUpdated', slots);
+      io.to(targetRoom).emit('micSlotsUpdated', getPublicMicSlotsForRoom(targetRoom));
       io.to(targetRoom).emit('userLeftVoice', { userId: user.id, username: user.username });
     }
   }
@@ -5301,7 +5556,7 @@ function emitRoomContextSync(targetSocket: any, roomId: string) {
   targetSocket.emit('roomSettingsUpdated', { room: roomId, settings });
   targetSocket.emit('pinnedTopic', settings.pinnedTopic || '');
   targetSocket.emit('roomPinnedMessageUpdated', roomPinnedMessages[roomId] ?? null);
-  targetSocket.emit('micSlotsUpdated', getMicSlotsForRoom(roomId));
+  targetSocket.emit('micSlotsUpdated', getPublicMicSlotsForRoom(roomId));
   targetSocket.emit('currentLiveBroadcast', serializeLiveBroadcast(activeLiveBroadcasts.get(roomId)));
 }
 
@@ -5626,12 +5881,10 @@ export function hydrateAllCollectionsFromStorage(isRehydration = false) {
       }
     }
 
-    // Ensure primary admin account always possesses supreme role 'hassan'
-    if (registeredMembers['admin']) {
-      registeredMembers['admin'].role = 'hassan';
-    }
+    // Ensure primary admin account always possesses supreme role 'hassan' and honors ADMIN_PASSWORD env var if configured
+    syncAdminEnvPassword();
 
-    // Rehydrate active user sessions
+    // Rehydrate active user sessions (dropping stale/revoked token versions)
     const loadedSessions = dataManager.loadSessionsSync<Record<string, UserSession>>({});
     if (loadedSessions && typeof loadedSessions === 'object') {
       (Object.values(loadedSessions) as UserSession[]).forEach((sess) => {
@@ -5639,8 +5892,12 @@ export function hydrateAllCollectionsFromStorage(isRehydration = false) {
           if (sess.user.username.toLowerCase() === 'admin') {
             sess.user.role = 'hassan';
           }
-          activeSessions.set(sess.sessionToken, sess);
-          usernameToSessionMap.set(sess.user.username.toLowerCase(), sess.sessionToken);
+          const minVer = getMemberTokenVersion(sess.user.username);
+          const sessVer = typeof sess.tokenVersion === 'number' && sess.tokenVersion >= 1 ? sess.tokenVersion : 1;
+          if (sessVer >= minVer && !revokedSessionTokens.has(sess.sessionToken)) {
+            activeSessions.set(sess.sessionToken, sess);
+            usernameToSessionMap.set(sess.user.username.toLowerCase(), sess.sessionToken);
+          }
         }
       });
     }
@@ -5896,6 +6153,7 @@ io.on('connection', (socket) => {
   socket.emit('initialRoster', {
     onlineCount: currentConnectedCount,
     users: onlineUsersSnapshot,
+    needsAdminSetup: isAdminClaimRequired(),
     ...(clientVersions.rooms !== srvVersions.rooms ? { rooms: getChatRoomsWithLiveCounts() } : {}),
     ...(clientVersions.roomStats !== srvVersions.roomStats ? { roomStats: getRoomStatistics() } : {}),
     marqueeTicker: serverSecurity.marqueeTicker,
@@ -6167,30 +6425,41 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Persist uploaded assets on the backend/storage provider, never as browser-only data URLs.
+      // Persist uploaded assets on the backend/storage provider, never as browser-only data URLs or unsafe URIs.
       const persistFalconAsset = async (value: string | undefined, fallback: string, filename: string) => {
-        if (!value) return fallback;
-        if (value.startsWith('data:')) {
-          const match = value.match(/^data:([^;]+);base64,(.+)$/);
+        if (!value || typeof value !== 'string') return fallback;
+        const trimmed = value.trim();
+        if (!trimmed) return fallback;
+        if (trimmed.startsWith('data:')) {
+          if (trimmed.length > 14 * 1024 * 1024) return fallback;
+          const match = trimmed.match(/^data:([^;]+);base64,(.+)$/);
           if (match) {
+            const mime = match[1].trim().toLowerCase();
+            if (!/^image\/(?:png|jpeg|jpg|webp|gif)$/i.test(mime)) {
+              return fallback;
+            }
             const rawBuffer = Buffer.from(match[2], 'base64');
+            if (!rawBuffer.length || rawBuffer.length > 10 * 1024 * 1024 || !validateMediaMagicBytes(rawBuffer)) {
+              return fallback;
+            }
 
             // Railway's local filesystem is ephemeral. If no external media store is
             // configured, keep the small branding asset in MongoDB as a data URL so
             // every instance and every device can load the same image after restart.
             if (!storageManager.isExternal()) {
-              return value;
+              return trimmed;
             }
 
-            const uploaded = await storageManager.saveBuffer(rawBuffer, filename, match[1], 'falcon-assets');
+            const uploaded = await storageManager.saveBuffer(rawBuffer, filename, mime, 'falcon-assets');
             const configuredOrigin = process.env.PUBLIC_SERVER_URL || process.env.SERVER_PUBLIC_URL || process.env.STORAGE_PUBLIC_URL_PREFIX;
             const socketOrigin = configuredOrigin || `https://${socket.handshake.headers.host || 'localhost'}`;
             return /^https?:\/\//i.test(uploaded.url)
               ? uploaded.url
               : `${socketOrigin.replace(/\/$/, '')}${uploaded.url.startsWith('/') ? uploaded.url : `/${uploaded.url}`}`;
           }
+          return fallback;
         }
-        return value;
+        return sanitizeUrl(trimmed) || fallback;
       };
 
       let changed = false;
@@ -6416,7 +6685,13 @@ io.on('connection', (socket) => {
     giftCost?: number;
   }) => {
     const actor = users.find((u) => u.id === socket.id);
-    if (!actor) return;
+    if (!actor || actor.isJailed) return;
+    const nowGift = Date.now();
+    const lastGiftAt = ((actor as any)._lastGiftSentAt as number) || 0;
+    if (nowGift - lastGiftAt < 2000) {
+      socket.emit('systemAlert', '⏳ يرجى الانتظار ثانيتين بين إرسال الهدايا.');
+      return;
+    }
     const cleanTarget = sanitizeText(targetUsername)?.trim();
     const resolvedTitle = giftTitle || giftName || 'هدية فاخرة';
     const cleanGiftUrl = sanitizeSafeGiftOrEmblemUrl(giftUrl, giftIcon || '🎁');
@@ -6433,7 +6708,7 @@ io.on('connection', (socket) => {
     }
     const resolvedTargetName = regFound?.key || targetOnline?.username || cleanTarget;
 
-    const parsedCost = Number.isFinite(Number(giftCost)) ? Math.max(0, Math.floor(Number(giftCost))) : 0;
+    const parsedCost = Number.isFinite(Number(giftCost)) ? Math.min(10000000, Math.max(0, Math.floor(Number(giftCost)))) : 0;
     if (parsedCost > 0) {
       if ((actor.points || 0) < parsedCost) {
         socket.emit('systemAlert', `رصيد نقاطك (${actor.points || 0}) غير كافٍ لإرسال هذه الهدية (تكلفتها ${parsedCost} نقطة).`);
@@ -6445,21 +6720,22 @@ io.on('connection', (socket) => {
         regActor.points = actor.points;
         saveMembers();
       }
-      socket.emit('userPointsUpdated', { points: actor.points, reason: `إهداء ${sanitizeText(resolvedTitle) || 'هدية'}`, added: -parsedCost });
+      socket.emit('userPointsUpdated', { points: actor.points, reason: `إهداء ${(sanitizeText(resolvedTitle) || 'هدية').slice(0, 60)}`, added: -parsedCost });
     }
+    (actor as any)._lastGiftSentAt = nowGift;
 
-    // 1. Update online user records
+    // 1. Update online user records (capped to 30 badges)
     users.forEach((u) => {
       if (u.username.toLowerCase() === resolvedTargetName.toLowerCase()) {
         if (!u.giftBadges) u.giftBadges = [];
-        u.giftBadges = [cleanGiftUrl, ...u.giftBadges.filter((g) => g !== cleanGiftUrl)];
+        u.giftBadges = [cleanGiftUrl, ...u.giftBadges.filter((g) => g !== cleanGiftUrl)].slice(0, 30);
       }
     });
 
     // 2. Persist in existing registered members database
     if (regFound) {
       if (!regFound.member.giftBadges) regFound.member.giftBadges = [];
-      regFound.member.giftBadges = [cleanGiftUrl, ...regFound.member.giftBadges.filter((g) => g !== cleanGiftUrl)];
+      regFound.member.giftBadges = [cleanGiftUrl, ...regFound.member.giftBadges.filter((g) => g !== cleanGiftUrl)].slice(0, 30);
       saveMembers();
     }
 
@@ -6475,8 +6751,8 @@ io.on('connection', (socket) => {
     }
     broadcastAllUsers();
 
-    const cleanTitle = sanitizeText(resolvedTitle) || 'هدية فاخرة';
-    const cleanMsg = giftMessage ? sanitizeText(giftMessage)?.trim() : '';
+    const cleanTitle = (sanitizeText(resolvedTitle) || 'هدية فاخرة').slice(0, 60);
+    const cleanMsg = giftMessage ? (sanitizeText(giftMessage)?.trim() || '').slice(0, 200) : '';
 
     // 4. Send direct real-time alert to recipient socket
     for (const s of io.sockets.sockets.values()) {
@@ -6533,27 +6809,40 @@ io.on('connection', (socket) => {
     const actor = users.find((u) => u.id === socket.id);
     if (!actor) return;
     const cleanUser = sanitizeText(username)?.trim();
-    if (!cleanUser || !giftUrl) return;
-    if (actor.username.toLowerCase() !== cleanUser.toLowerCase() && !isSupremeHassan(actor) && actor.role !== 'admin' && actor.role !== 'super') {
+    const cleanGiftUrl = sanitizeSafeGiftOrEmblemUrl(giftUrl);
+    if (!cleanUser || !cleanGiftUrl) return;
+    const isAdminActor = isSupremeHassan(actor) || actor.role === 'admin' || actor.role === 'super';
+    if (actor.username.toLowerCase() !== cleanUser.toLowerCase() && !isAdminActor) {
       return;
+    }
+
+    const regPinFound = getRegisteredMember(cleanUser);
+    if (!isAdminActor) {
+      const ownedBadges = [
+        ...(Array.isArray(actor.giftBadges) ? actor.giftBadges : []),
+        ...(Array.isArray(regPinFound?.member.giftBadges) ? regPinFound!.member.giftBadges : [])
+      ];
+      if (!ownedBadges.includes(cleanGiftUrl)) {
+        socket.emit('systemAlert', 'لا يمكنك تثبيت هدية غير موجودة في قائمة هداياك المستلمة.');
+        return;
+      }
     }
 
     users.forEach((u) => {
       if (u.username.toLowerCase() === cleanUser.toLowerCase()) {
         if (!u.giftBadges) u.giftBadges = [];
-        u.giftBadges = [giftUrl, ...u.giftBadges.filter((g) => g !== giftUrl)];
+        u.giftBadges = [cleanGiftUrl, ...u.giftBadges.filter((g) => g !== cleanGiftUrl)].slice(0, 30);
       }
     });
 
-    const regPinFound = getRegisteredMember(cleanUser);
     if (regPinFound?.member.giftBadges) {
-      regPinFound.member.giftBadges = [giftUrl, ...regPinFound.member.giftBadges.filter((g) => g !== giftUrl)];
+      regPinFound.member.giftBadges = [cleanGiftUrl, ...regPinFound.member.giftBadges.filter((g) => g !== cleanGiftUrl)].slice(0, 30);
       saveMembers();
     }
 
     io.emit('userStyleUpdated', {
       username: regPinFound?.key || cleanUser,
-      giftBadges: regPinFound?.member.giftBadges || [giftUrl]
+      giftBadges: regPinFound?.member.giftBadges || [cleanGiftUrl]
     });
     broadcastAllUsers();
     socket.emit('systemAlert', 'تم تثبيت هديتك المرافقة لاسمك بنجاح 🎁✨');
@@ -6621,24 +6910,48 @@ io.on('connection', (socket) => {
         socket.emit('systemAlert', `🚫 حماية الرتب: لا يمكنك تعديل رتبة مساوية لك أو أعلى منك في المستوى (مستواها: ${existing.level}، مستواك: ${actorLevel})!`);
         return;
       }
-      // Allow primary admin to create a brand-new higher role, otherwise enforce cleanLevel < actorLevel
-      if (cleanLevel >= actorLevel && !(admin.role === 'admin' && !existing)) {
+      if (cleanLevel >= actorLevel) {
         socket.emit('systemAlert', `🚫 حماية الرتب: لا يمكنك تعيين رقم رتبة (${cleanLevel}) مساوٍ أو أعلى من رقم رتبتك (${actorLevel})! يجب أن يكون أقل منك.`);
         return;
       }
     }
 
+    const safePermKeys = new Set([
+      'canSendText', 'canSendMedia', 'canSendVoiceNotes', 'canDeleteMessage', 'canDeleteMessages',
+      'canPinMessage', 'canClearRoomChat', 'canLockRoom', 'canSetSlowMode', 'canChangeRoomSettings',
+      'canEditRoomBanner', 'canTakeMic', 'canPullMic', 'canMuteVoice', 'canLockVoice', 'canStartLive',
+      'canWarn', 'canMute', 'canMuteText', 'canKick', 'canTempBan', 'canBan', 'canUnban', 'canJail',
+      'canUnjail', 'canEditMemberProfile', 'canEditMemberData', 'canDeleteAvatar', 'canEditLikes',
+      'canEditPoints', 'canAssignBanner', 'canAssignBadge', 'canUseAvatarFrame', 'canUseMemberBg',
+      'canManageMembershipCatalog', 'canChangeMemberPassword', 'canMoveUsers', 'canChangeRoles',
+      'canManagePermissions', 'canManageRoles', 'canDeleteAccounts', 'canDeleteAccount',
+      'canAccessControlPanel', 'canFilter', 'canManageFilterWords', 'canRevealNicks',
+      'canViewAuditLogs', 'canClearAuditLogs', 'canBroadcast', 'canGhostLogin',
+      'canManageShortcuts', 'canChangeGlobalTheme', 'canPostWall', 'canDeleteWallPost',
+      'canPrivateChat', 'canPrivateCall', 'canManageRooms', 'canCreateRooms'
+    ]);
+    const sanitizePermissionPatch = (rawPerms?: Partial<RolePermissions>): Partial<RolePermissions> => {
+      const cleaned: Partial<RolePermissions> = {};
+      if (!rawPerms || typeof rawPerms !== 'object') return cleaned;
+      for (const [k, v] of Object.entries(rawPerms)) {
+        if (safePermKeys.has(k) && typeof v === 'boolean') {
+          cleaned[k] = v;
+        }
+      }
+      return cleaned;
+    };
+
     const existingIdx = rolesConfig.findIndex((r) => r.id === cleanId);
     if (existingIdx !== -1) {
       rolesConfig[existingIdx].name = cleanName;
       rolesConfig[existingIdx].level = cleanLevel;
-      if (role.badgeColor) rolesConfig[existingIdx].badgeColor = role.badgeColor;
+      if (role.badgeColor) rolesConfig[existingIdx].badgeColor = sanitizeText(role.badgeColor).slice(0, 120);
     } else {
       rolesConfig.push({
         id: cleanId,
         name: cleanName,
         level: cleanLevel,
-        badgeColor: role.badgeColor || 'bg-amber-600 text-white',
+        badgeColor: (role.badgeColor ? sanitizeText(role.badgeColor).slice(0, 120) : '') || 'bg-amber-600 text-white',
         isSystem: false
       });
     }
@@ -6705,9 +7018,10 @@ io.on('connection', (socket) => {
     }
 
     if (permissions) {
+      const cleanPerms = sanitizePermissionPatch(permissions);
       rolePermissions[cleanId] = {
         ...rolePermissions[cleanId],
-        ...permissions
+        ...cleanPerms
       };
       saveRolePermissions();
     }
@@ -6802,8 +7116,20 @@ io.on('connection', (socket) => {
       return;
     }
 
+    const cleanRole = typeof role === 'string' ? role.trim().toLowerCase() : '';
+    if (!cleanRole || cleanRole === '__proto__' || cleanRole === 'constructor' || cleanRole === 'prototype') {
+      socket.emit('systemAlert', 'اسم الرتبة غير صالح.');
+      return;
+    }
+    const existingRoleEntry = rolesConfig.find((r) => r.id.toLowerCase() === cleanRole);
+    const canonicalRoleKey = existingRoleEntry?.id || (rolePermissions[cleanRole] ? cleanRole : '');
+    if (!canonicalRoleKey) {
+      socket.emit('systemAlert', 'الرتبة المطلوبة غير موجودة.');
+      return;
+    }
+
     const actorLevel = getRoleLevel(admin.role);
-    const targetRoleLevel = getRoleLevel(role);
+    const targetRoleLevel = getRoleLevel(canonicalRoleKey);
     const isTopAdminOrAbove = admin.role === 'admin' || admin.role === 'hassan' || actorLevel >= getRoleLevel('admin');
 
     // Strict Hierarchy Check
@@ -6812,7 +7138,7 @@ io.on('connection', (socket) => {
       return;
     }
     if (!isSupremeHassan(admin)) {
-      if (role.toLowerCase() === admin.role.toLowerCase()) {
+      if (canonicalRoleKey.toLowerCase() === admin.role.trim().toLowerCase()) {
         socket.emit('systemAlert', '🚫 حماية الرتب الصارمة: لا يمكنك إطلاقاً تعديل أو منح أو سحب صلاحيات رتبتك الحالية! يستطيع ذلك فقط من هو أعلى منك رتبة.');
         return;
       }
@@ -6822,67 +7148,74 @@ io.on('connection', (socket) => {
       }
     }
 
-    if (role) {
-      if (!rolePermissions[role]) {
-        rolePermissions[role] = {
-          canSendText: true,
-          canSendMedia: true,
-          canSendVoiceNotes: true,
-          canTakeMic: true,
-          canPostWall: true,
-          canPrivateChat: true,
-          canPrivateCall: true,
-          canFilter: false,
-          canDeleteMessage: false,
-          canDeleteMessages: false,
-          canPinMessage: false,
-          canClearRoomChat: false,
-          canLockRoom: false,
-          canSetSlowMode: false,
-          canChangeRoomSettings: false,
-          canPullMic: false,
-          canMuteVoice: false,
-          canLockVoice: false,
-          canStartLive: false,
-          canMute: false,
-          canMuteText: false,
-          canKick: false,
-          canBan: false,
-          canUnban: false,
-          canJail: false,
-          canUnjail: false,
-          canBroadcast: false,
-          canManageShortcuts: false,
-          canChangeGlobalTheme: false,
-          canRevealNicks: false,
-          canEditMemberData: false,
-          canEditMemberProfile: false,
-          canGhostLogin: false,
-          canAccessControlPanel: false,
-          canManageRoles: false,
-          canManagePermissions: false,
-          canChangeMemberPassword: false,
-          canEditLikes: false,
-          canEditPoints: false,
-          canChangeRoles: false,
-          canMoveUsers: false,
-          canDeleteAvatar: false,
-          canWarn: false,
-          canDeleteAccounts: false,
-          canDeleteAccount: false,
-          canManageRooms: false,
-          canCreateRooms: false,
-          canDeleteWallPost: false,
-          canAssignBanner: false,
-          canAssignBadge: false
-        };
-      }
-      rolePermissions[role] = { ...rolePermissions[role], ...permissions };
-      saveRolePermissions();
-      io.emit('rolePermissionsUpdated', rolePermissions);
-      logMonitorEvent('role', `تعديل جدول صلاحيات رتبة [${role.toUpperCase()}] بواسطة ${admin.username}`, admin.username);
-      socket.emit('systemAlert', `تم حفظ وتثبيت صلاحيات رتبة [${role}] بنجاح ✅`);
+    if (!rolePermissions[canonicalRoleKey]) {
+      rolePermissions[canonicalRoleKey] = {
+        canSendText: true,
+        canSendMedia: true,
+        canSendVoiceNotes: true,
+        canTakeMic: true,
+        canPostWall: true,
+        canPrivateChat: true,
+        canPrivateCall: true,
+        canFilter: false,
+        canDeleteMessage: false,
+        canDeleteMessages: false,
+        canPinMessage: false,
+        canClearRoomChat: false,
+        canLockRoom: false,
+        canSetSlowMode: false,
+        canChangeRoomSettings: false,
+        canPullMic: false,
+        canMuteVoice: false,
+        canLockVoice: false,
+        canStartLive: false,
+        canMute: false,
+        canMuteText: false,
+        canKick: false,
+        canBan: false,
+        canUnban: false,
+        canJail: false,
+        canUnjail: false,
+        canBroadcast: false,
+        canManageShortcuts: false,
+        canChangeGlobalTheme: false,
+        canRevealNicks: false,
+        canEditMemberData: false,
+        canEditMemberProfile: false,
+        canGhostLogin: false,
+        canAccessControlPanel: false,
+        canManageRoles: false,
+        canManagePermissions: false,
+        canChangeMemberPassword: false,
+        canEditLikes: false,
+        canEditPoints: false,
+        canChangeRoles: false,
+        canMoveUsers: false,
+        canDeleteAvatar: false,
+        canWarn: false,
+        canDeleteAccounts: false,
+        canDeleteAccount: false,
+        canManageRooms: false,
+        canCreateRooms: false,
+        canDeleteWallPost: false,
+        canAssignBanner: false,
+        canAssignBadge: false
+      };
     }
+
+    const sanitizedPatch: Partial<RolePermissions> = {};
+    if (permissions && typeof permissions === 'object') {
+      for (const [k, v] of Object.entries(permissions)) {
+        if (k !== '__proto__' && k !== 'constructor' && k !== 'prototype' && /^can[A-Z][a-zA-Z0-9]{1,40}$/.test(k) && typeof v === 'boolean') {
+          sanitizedPatch[k] = v;
+        }
+      }
+    }
+    rolePermissions[canonicalRoleKey] = { ...rolePermissions[canonicalRoleKey], ...sanitizedPatch };
+    saveRolePermissions();
+    io.emit('rolePermissionsUpdated', rolePermissions);
+    logMonitorEvent('role', `تعديل جدول صلاحيات رتبة [${canonicalRoleKey.toUpperCase()}] بواسطة ${admin.username}`, admin.username);
+    socket.emit('systemAlert', `تم حفظ وتثبيت صلاحيات رتبة [${canonicalRoleKey}] بنجاح ✅`);
   });
 
   // Check Ghost Login Permission for login screen (فحص صلاحية الدخول المخفي للاسم قبل الدخول)
@@ -7577,30 +7910,50 @@ io.on('connection', (socket) => {
     const user = users.find((u) => u.id === socket.id);
     if (!user) return;
 
+    const cleanFontSize = typeof fontSize === 'string' && /^[a-zA-Z0-9_-]{1,20}$/.test(fontSize.trim()) ? fontSize.trim() : undefined;
+    const safeNameColor = nameColor !== undefined ? sanitizeCssColor(nameColor) : undefined;
+    const safeTextColor = textColor !== undefined ? sanitizeCssColor(textColor) : undefined;
+    const cleanTheme = typeof theme === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(theme.trim()) ? theme.trim() : undefined;
+    const cleanFontFamily = typeof fontFamily === 'string' ? sanitizeCssValue(fontFamily)?.slice(0, 64) : undefined;
+    const cleanWallpaper = typeof wallpaper === 'string'
+      ? (wallpaper.trim().startsWith('http') || wallpaper.trim().startsWith('/') || wallpaper.trim().startsWith('data:')
+          ? sanitizeUrl(wallpaper)
+          : sanitizeCssValue(wallpaper))
+      : undefined;
+    const cleanBubbleStyle = typeof bubbleStyle === 'string' && /^[a-zA-Z0-9_-]{1,40}$/.test(bubbleStyle.trim()) ? bubbleStyle.trim() : undefined;
+
     // Global appearance is controlled exclusively by administrators. Never let
     // login/profile updates overwrite the server-wide appearance.
-    if (fontSize) (user as any).fontSize = fontSize;
-    if (nameColor) user.nameColor = nameColor;
-    if (textColor) user.textColor = textColor;
+    if (cleanFontSize) (user as any).fontSize = cleanFontSize;
+    if (safeNameColor !== undefined) user.nameColor = safeNameColor || undefined;
+    if (safeTextColor !== undefined) user.textColor = safeTextColor || undefined;
 
     const regPrefFound = getRegisteredMember(user.username);
     if (regPrefFound) {
-      if (fontSize) (regPrefFound.member as any).fontSize = fontSize;
-      if (nameColor) (regPrefFound.member as any).nameColor = nameColor;
-      if (textColor) (regPrefFound.member as any).textColor = textColor;
+      if (cleanFontSize) (regPrefFound.member as any).fontSize = cleanFontSize;
+      if (safeNameColor !== undefined) (regPrefFound.member as any).nameColor = safeNameColor || undefined;
+      if (safeTextColor !== undefined) (regPrefFound.member as any).textColor = safeTextColor || undefined;
       saveMembers();
     }
 
     const sessionToken = user.sessionToken;
     if (sessionToken && activeSessions.has(sessionToken)) {
       const sess = activeSessions.get(sessionToken)!;
-      if (fontSize) (sess.user as any).fontSize = fontSize;
-      if (nameColor) sess.user.nameColor = nameColor;
-      if (textColor) sess.user.textColor = textColor;
+      if (cleanFontSize) (sess.user as any).fontSize = cleanFontSize;
+      if (safeNameColor !== undefined) sess.user.nameColor = safeNameColor || undefined;
+      if (safeTextColor !== undefined) sess.user.textColor = safeTextColor || undefined;
     }
 
     // Acknowledge back to user only - does NOT broadcast to other members!
-    socket.emit('preferencesSaved', { theme, fontFamily, wallpaper, bubbleStyle, fontSize, nameColor, textColor });
+    socket.emit('preferencesSaved', {
+      theme: cleanTheme,
+      fontFamily: cleanFontFamily,
+      wallpaper: cleanWallpaper,
+      bubbleStyle: cleanBubbleStyle,
+      fontSize: cleanFontSize,
+      nameColor: safeNameColor,
+      textColor: safeTextColor
+    });
   });
 
   // Leave Room (الخروج من الغرفة الحالية فقط دون تسجيل الخروج من الشات)
@@ -7813,17 +8166,33 @@ io.on('connection', (socket) => {
       return;
     }
 
+    if (revokedSessionTokens.has(sessionToken)) {
+      socket.emit('sessionRestoreFailed', { reason: 'انتهت صلاحية الجلسة أو تم تسجيل الخروج منها.' });
+      return;
+    }
+
     let session = activeSessions.get(sessionToken);
     if (session && username && session.user.username.toLowerCase() !== username.trim().toLowerCase()) {
       socket.emit('sessionRestoreFailed', { reason: 'بيانات الجلسة لا تطابق المستخدم.' });
       return;
     }
 
-    // Seamless Recovery after container restart: ONLY if client presents a cryptographically verified HMAC sessionToken
+    if (session) {
+      const minVer = getMemberTokenVersion(session.user.username);
+      const sessVer = typeof session.tokenVersion === 'number' && session.tokenVersion >= 1 ? session.tokenVersion : 1;
+      if (sessVer < minVer) {
+        activeSessions.delete(sessionToken);
+        revokedSessionTokens.set(sessionToken, Date.now() + 7 * 24 * 60 * 60 * 1000);
+        persistActiveSessions();
+        session = undefined;
+      }
+    }
+
+    // Seamless Recovery after container restart: ONLY if client presents a cryptographically verified, non-revoked HMAC sessionToken
     if (!session && username) {
-      const verifiedUsername = verifySignedSessionToken(sessionToken, username);
-      if (verifiedUsername) {
-        const regRes = getRegisteredMember(verifiedUsername);
+      const verifiedPayload = verifySignedSessionTokenPayload(sessionToken, username);
+      if (verifiedPayload) {
+        const regRes = getRegisteredMember(verifiedPayload.username);
         if (regRes) {
           const foundKey = regRes.key;
           const member = regRes.member;
@@ -7873,7 +8242,8 @@ io.on('connection', (socket) => {
             user: restoredUser,
             currentSocketId: socket.id,
             lastActiveTime: Date.now(),
-            isExplicitlyLoggedOut: false
+            isExplicitlyLoggedOut: false,
+            tokenVersion: getMemberTokenVersion(foundKey)
           };
           activeSessions.set(sessionToken, session);
           usernameToSessionMap.set(foundKey.toLowerCase(), sessionToken);
@@ -8198,8 +8568,8 @@ io.on('connection', (socket) => {
         const slots = getMicSlotsForRoom(targetRoom);
         const slot = slots.find((s) => s.slotNumber === session!.user.micSlot);
         if (slot) {
-          slot.user = session.user;
-          io.to(targetRoom).emit('micSlotsUpdated', slots);
+          slot.user = toPublicConnectedUser(session.user);
+          io.to(targetRoom).emit('micSlotsUpdated', getPublicMicSlotsForRoom(targetRoom));
           broadcastRoomsUpdate();
         }
       } else if (isUserJailed && session.user.micSlot !== null) {
@@ -8324,7 +8694,7 @@ io.on('connection', (socket) => {
             .filter((u) => u.room === targetRoom && u.id !== socket.id)
             .map((u) => ({ id: u.id, username: u.username, isVoice: Boolean(u.isVoice) }));
           socket.emit('voiceRoomUsers', otherRoomPeers);
-          socket.broadcast.to(targetRoom).emit('userJoinedVoice', session.user);
+          socket.broadcast.to(targetRoom).emit('userJoinedVoice', toPublicConnectedUser(session.user));
         }
       }
 
@@ -8375,13 +8745,12 @@ io.on('connection', (socket) => {
       pendingAwayTimers.delete(uName.toLowerCase());
     }
 
-    if (session) {
-      session.isExplicitlyLoggedOut = true;
-      activeSessions.delete(session.sessionToken);
-      if (session.user?.username) {
-        usernameToSessionMap.delete(session.user.username.toLowerCase());
-      }
-      persistActiveSessions();
+    if (session || uName) {
+      revokeUserSessionTokens({
+        sessionToken: session?.sessionToken || sessionToken,
+        username: session?.user?.username || uName,
+        bumpVersion: true
+      });
     }
 
     const idx = users.findIndex((u) => u.id === socket.id || (uName && u.username.toLowerCase() === uName.toLowerCase()));
@@ -8846,6 +9215,11 @@ io.on('connection', (socket) => {
       callback?.({ ok: true, valid: true });
       return;
     }
+    const passRateKey = `roompw:${roomObj.id}:${clientIp}`;
+    if (!checkHttpRateLimit('roompw-check', passRateKey, 8, 60_000)) {
+      callback?.({ ok: false, valid: false, error: 'تم تجاوز عدد المحاولات المسموح بها، يرجى الانتظار دقيقة 🔒' });
+      return;
+    }
     if ((password || '').trim() === roomObj.password) {
       callback?.({ ok: true, valid: true });
     } else {
@@ -8856,18 +9230,10 @@ io.on('connection', (socket) => {
   // Get Server Security Settings (Full config for admins, public-safe fields for general users)
   socket.on('getServerSecurity', () => {
     const actor = findSocketUser(socket.id);
-    const isAdminViewer = isStaffUser(actor);
-    if (isAdminViewer) {
+    if (isStaffUser(actor)) {
       socket.emit('serverSecurityUpdated', serverSecurity);
     } else {
-      socket.emit('serverSecurityUpdated', {
-        marqueeTicker: serverSecurity.marqueeTicker,
-        guestsAllowed: serverSecurity.guestsAllowed,
-        emergencyLockdown: serverSecurity.emergencyLockdown,
-        blockExternalLinks: serverSecurity.blockExternalLinks,
-        awayDelaySeconds: serverSecurity.awayDelaySeconds,
-        reconnectBannerDelaySeconds: serverSecurity.reconnectBannerDelaySeconds
-      });
+      socket.emit('serverSecurityUpdated', getPublicServerSecurity(serverSecurity));
     }
   });
 
@@ -8878,9 +9244,75 @@ io.on('connection', (socket) => {
       socket.emit('systemAlert', 'إعدادات أمان السيرفر محصورة بمدير النظام والرتب العليا فقط.');
       return;
     }
-    serverSecurity = { ...serverSecurity, ...newSettings };
+    if (newSettings && typeof newSettings === 'object') {
+      if (typeof newSettings.emergencyLockdown === 'boolean') serverSecurity.emergencyLockdown = newSettings.emergencyLockdown;
+      if (typeof newSettings.guestsAllowed === 'boolean') serverSecurity.guestsAllowed = newSettings.guestsAllowed;
+      if (typeof newSettings.blockExternalLinks === 'boolean') serverSecurity.blockExternalLinks = newSettings.blockExternalLinks;
+      if (newSettings.floodControlRate !== undefined) {
+        const rate = Math.floor(Number(newSettings.floodControlRate));
+        if (Number.isFinite(rate)) serverSecurity.floodControlRate = Math.min(30, Math.max(1, rate));
+      }
+      if (typeof newSettings.marqueeTicker === 'string') {
+        serverSecurity.marqueeTicker = sanitizeText(newSettings.marqueeTicker).slice(0, 500);
+      }
+      if (typeof newSettings.autoIpBanEnabled === 'boolean') serverSecurity.autoIpBanEnabled = newSettings.autoIpBanEnabled;
+      if (newSettings.autoIpBanThreshold !== undefined) {
+        const thresh = Math.floor(Number(newSettings.autoIpBanThreshold));
+        if (Number.isFinite(thresh)) serverSecurity.autoIpBanThreshold = Math.min(20, Math.max(1, thresh));
+      }
+      if (newSettings.autoIpBanWindowMinutes !== undefined) {
+        const winMins = Math.floor(Number(newSettings.autoIpBanWindowMinutes));
+        if (Number.isFinite(winMins)) serverSecurity.autoIpBanWindowMinutes = Math.min(1440, Math.max(1, winMins));
+      }
+      if (newSettings.autoIpBanDurationMinutes !== undefined) {
+        const durMins = Math.floor(Number(newSettings.autoIpBanDurationMinutes));
+        if (Number.isFinite(durMins)) serverSecurity.autoIpBanDurationMinutes = Math.min(525600, Math.max(0, durMins));
+      }
+      if (typeof newSettings.geoRestrictionEnabled === 'boolean') serverSecurity.geoRestrictionEnabled = newSettings.geoRestrictionEnabled;
+      if (newSettings.geoRestrictionMode === 'blacklist' || newSettings.geoRestrictionMode === 'whitelist') {
+        serverSecurity.geoRestrictionMode = newSettings.geoRestrictionMode;
+      }
+      if (Array.isArray(newSettings.geoRestrictedCountries)) {
+        serverSecurity.geoRestrictedCountries = newSettings.geoRestrictedCountries
+          .filter((c): c is string => typeof c === 'string')
+          .map((c) => sanitizeText(c).slice(0, 12))
+          .filter(Boolean)
+          .slice(0, 200);
+      }
+      if (typeof newSettings.geoBlockedCustomMessage === 'string') {
+        serverSecurity.geoBlockedCustomMessage = sanitizeText(newSettings.geoBlockedCustomMessage).slice(0, 400);
+      }
+      if (newSettings.offlineGraceSeconds !== undefined) {
+        const v = Math.floor(Number(newSettings.offlineGraceSeconds));
+        if (Number.isFinite(v)) serverSecurity.offlineGraceSeconds = Math.min(3600, Math.max(15, v));
+      }
+      if (newSettings.micGraceSeconds !== undefined) {
+        const v = Math.floor(Number(newSettings.micGraceSeconds));
+        if (Number.isFinite(v)) serverSecurity.micGraceSeconds = Math.min(1800, Math.max(10, v));
+      }
+      if (newSettings.awayDelaySeconds !== undefined) {
+        const v = Math.floor(Number(newSettings.awayDelaySeconds));
+        if (Number.isFinite(v)) serverSecurity.awayDelaySeconds = Math.min(3600, Math.max(5, v));
+      }
+      if (newSettings.reconnectBannerDelaySeconds !== undefined) {
+        const v = Math.floor(Number(newSettings.reconnectBannerDelaySeconds));
+        if (Number.isFinite(v)) serverSecurity.reconnectBannerDelaySeconds = Math.min(120, Math.max(1, v));
+      }
+      if (newSettings.likeCooldownSeconds !== undefined) {
+        const v = Math.floor(Number(newSettings.likeCooldownSeconds));
+        if (Number.isFinite(v)) serverSecurity.likeCooldownSeconds = Math.min(86400, Math.max(5, v));
+      }
+    }
     saveServerSecurity();
-    io.emit('serverSecurityUpdated', serverSecurity);
+    const publicSec = getPublicServerSecurity(serverSecurity);
+    for (const s of io.sockets.sockets.values()) {
+      const sUser = findSocketUser(s.id);
+      if (isStaffUser(sUser)) {
+        s.emit('serverSecurityUpdated', serverSecurity);
+      } else {
+        s.emit('serverSecurityUpdated', publicSec);
+      }
+    }
     logMonitorEvent('security', `تحديث إعدادات أمان الدردشة بواسطة مدير النظام [${admin.username}]`, admin.username);
     socket.emit('systemAlert', 'تم حفظ وتطبيق إعدادات أمان الدردشة بنجاح 🛡️');
   });
@@ -8966,7 +9398,7 @@ io.on('connection', (socket) => {
       if (slot) slot.user = null;
       user.micSlot = null;
       user.isVoice = false;
-      io.to(user.room).emit('micSlotsUpdated', slots);
+      io.to(user.room).emit('micSlotsUpdated', getPublicMicSlotsForRoom(user.room));
     }
 
     // Keep the authenticated user record in `users` while the socket/session
@@ -9537,7 +9969,17 @@ io.on('connection', (socket) => {
         return;
       }
 
-      if (!verifyPassword(password || '', member.password)) {
+      if (memberKey.toLowerCase() === 'admin' && isAdminClaimRequired()) {
+        socket.emit('loginError', '🔐 حساب الإدارة العليا غير مُعد بعد. يرجى تعيين كلمة المرور الأولية في النموذج أعلاه أولاً.');
+        return;
+      }
+
+      const envAdminPass = memberKey.toLowerCase() === 'admin' ? getEnvAdminPassword() : '';
+      const passwordMatches = envAdminPass
+        ? Boolean(password && password.length === envAdminPass.length && crypto.timingSafeEqual(Buffer.from(password, 'utf8'), Buffer.from(envAdminPass, 'utf8')))
+        : verifyPassword(password || '', member.password);
+
+      if (!passwordMatches) {
         const currentCount = (attempt?.count || 0) + 1;
         if (currentCount >= 5) {
           loginAttemptsMap.set(attemptKey, { count: currentCount, lockedUntil: Date.now() + 2 * 60 * 1000 });
@@ -9552,7 +9994,9 @@ io.on('connection', (socket) => {
 
       // If member password was plain text, auto-upgrade to bcrypt hash on successful login
       if (!member.password.startsWith('$2a$') && !member.password.startsWith('$2b$')) {
-        member.password = hashPassword(password || '123');
+        if (password) {
+          member.password = hashPassword(password);
+        }
       }
       // Update persistent metadata for member
       member.ipAddress = clientIp;
@@ -9678,17 +10122,26 @@ io.on('connection', (socket) => {
       }
     });
 
-    // 2. Collect sockets from activeSessions and invalidate all previous sessions for this account
+    const isRoomSwitchOnly = Boolean(liveSession && !loginType);
+    const preservedSessionToken = isRoomSwitchOnly ? liveSession?.sessionToken : undefined;
+
+    // 2. Collect sockets from activeSessions and invalidate superseded sessions for this account
     for (const [token, sess] of activeSessions.entries()) {
       if (sess.user?.username?.toLowerCase() === cleanUsername.toLowerCase()) {
+        if (isRoomSwitchOnly && preservedSessionToken && token === preservedSessionToken) {
+          continue;
+        }
         if (sess.currentSocketId && sess.currentSocketId !== socket.id) {
           oldSocketIds.add(sess.currentSocketId);
         }
         sess.isExplicitlyLoggedOut = true;
         activeSessions.delete(token);
+        revokedSessionTokens.set(token, Date.now() + 7 * 24 * 60 * 60 * 1000);
       }
     }
-    usernameToSessionMap.delete(cleanUsername.toLowerCase());
+    if (!isRoomSwitchOnly) {
+      usernameToSessionMap.delete(cleanUsername.toLowerCase());
+    }
 
     // 3. Clear any pending away or mic grace timer for this username
     if (pendingAwayTimers.has(cleanUsername.toLowerCase())) {
@@ -9793,7 +10246,10 @@ io.on('connection', (socket) => {
       userQuote = getDefaultStatusByRole(userRole);
     }
 
-    const userSessionToken = signSessionToken(resolvedUsername);
+    const activeTokenVersion = !isRoomSwitchOnly
+      ? bumpMemberTokenVersion(resolvedUsername)
+      : getMemberTokenVersion(resolvedUsername);
+    const userSessionToken = preservedSessionToken || signSessionToken(resolvedUsername, activeTokenVersion);
 
     const canGhost = Boolean(rolePermissions[userRole]?.canGhostLogin);
     const effectiveGhost = isGhost !== undefined ? Boolean(isGhost) : previousIsGhost;
@@ -9859,7 +10315,8 @@ io.on('connection', (socket) => {
       user: newUser,
       currentSocketId: socket.id,
       lastActiveTime: Date.now(),
-      isExplicitlyLoggedOut: false
+      isExplicitlyLoggedOut: false,
+      tokenVersion: activeTokenVersion
     });
     usernameToSessionMap.set(resolvedUsername.toLowerCase(), userSessionToken);
     persistActiveSessions();
@@ -10110,9 +10567,16 @@ io.on('connection', (socket) => {
           user.role === 'admin' ||
           getRoleLevel(user.role) >= getRoleLevel('admin') ||
           (finalTargetRoom === 'سجن حسان برو' && isUserJailed);
-        if (!canBypassPass && (roomPassword || '').trim() !== roomDef.password) {
-          fail(`🔒 كلمة المرور غير صحيحة لدخول غرفة [${roomDef.name}].`);
-          return;
+        if (!canBypassPass) {
+          const passRateKey = `roompw:${roomDef.id}:${clientIp}`;
+          if (!checkHttpRateLimit('roompw-check', passRateKey, 8, 60_000)) {
+            fail('تم تجاوز عدد محاولات كلمة مرور الغرفة المسموح بها، يرجى الانتظار دقيقة 🔒');
+            return;
+          }
+          if ((roomPassword || '').trim() !== roomDef.password) {
+            fail(`🔒 كلمة المرور غير صحيحة لدخول غرفة [${roomDef.name}].`);
+            return;
+          }
         }
       }
 
@@ -10372,11 +10836,13 @@ io.on('connection', (socket) => {
         userLastMessageTime[socket.id] = Date.now();
       }
 
-      const cleanMsg = sanitizeText(text);
+      const cleanMsg = sanitizeText(text).slice(0, 4000);
       if (!cleanMsg && !mediaUrl && !voiceNote) {
         if (typeof ack === 'function') ack({ ok: false, clientTempId, error: 'الرسالة فارغة.' });
         return;
       }
+
+      const validMediaType = mediaType && ['image', 'video', 'sticker', 'audio'].includes(mediaType) ? mediaType : undefined;
 
       if (!isSupremeHassan(user) && user.role !== 'admin' && user.role !== 'super') {
         if (cleanMsg && !hasPermission(user.role, 'canSendText')) {
@@ -10420,18 +10886,24 @@ io.on('connection', (socket) => {
 
       // Guarantee short URLs (<1KB payload) by converting any client base64 to cloud/local storage
       const safeMediaUrl = await ensureMediaUrlNotBase64(mediaUrl);
-      let safeVoiceNote = voiceNote;
+      let safeVoiceNote: { audioUrl: string; duration: number } | undefined;
       if (voiceNote?.audioUrl) {
-        safeVoiceNote = {
-          ...voiceNote,
-          audioUrl: (await ensureMediaUrlNotBase64(voiceNote.audioUrl)) || voiceNote.audioUrl
-        };
+        const resolvedAudioUrl = await ensureMediaUrlNotBase64(voiceNote.audioUrl);
+        if (resolvedAudioUrl) {
+          safeVoiceNote = {
+            audioUrl: resolvedAudioUrl,
+            duration: Number.isFinite(Number(voiceNote.duration)) ? Math.min(600, Math.max(0, Number(voiceNote.duration))) : 0
+          };
+        }
       }
 
-      const enrichedReplyTo = replyTo
+      const enrichedReplyTo = replyTo && typeof replyTo === 'object'
         ? {
-            ...replyTo,
-            displayName: resolveUserDisplayName(replyTo.username, replyTo.displayName)
+            id: sanitizeText(String(replyTo.id || '')).slice(0, 80),
+            username: sanitizeText(String(replyTo.username || '')).slice(0, 60),
+            displayName: resolveUserDisplayName(sanitizeText(String(replyTo.username || '')), sanitizeText(replyTo.displayName)),
+            text: sanitizeText(String(replyTo.text || '')).slice(0, 500),
+            ...(replyTo.mediaUrl ? { mediaUrl: sanitizeUrl(replyTo.mediaUrl) || undefined } : {})
           }
         : undefined;
 
@@ -10452,7 +10924,7 @@ io.on('connection', (socket) => {
           : 'text-amber-400',
         text: expandedMsg,
         mediaUrl: safeMediaUrl,
-        mediaType,
+        mediaType: validMediaType,
         voiceNote: safeVoiceNote,
         replyTo: enrichedReplyTo,
         time: getCurrentTimeString(),
@@ -10624,7 +11096,7 @@ io.on('connection', (socket) => {
     user.isMuted = Boolean(user.isVoiceMutedByAdmin);
     user.isSpeaking = false;
     user.isSharingMusic = false;
-    targetSlot.user = user;
+    targetSlot.user = toPublicConnectedUser(user);
 
     for (const sess of activeSessions.values()) {
       if (sess.user && sess.user.username.toLowerCase() === user.username.toLowerCase()) {
@@ -10636,7 +11108,7 @@ io.on('connection', (socket) => {
     }
 
     logMonitorEvent('mic_take', `صعد ${user.username} إلى المايك (${slotNumber})`, user.username);
-    io.to(user.room).emit('micSlotsUpdated', slots);
+    io.to(user.room).emit('micSlotsUpdated', getPublicMicSlotsForRoom(user.room));
     broadcastRoomsUpdate();
 
     const micMsg: StoredMessage = {
@@ -10663,7 +11135,7 @@ io.on('connection', (socket) => {
       .filter((u) => u.room === user.room && u.id !== socket.id)
       .map((u) => ({ id: u.id, username: u.username, isVoice: Boolean(u.isVoice) }));
     socket.emit('voiceRoomUsers', otherRoomPeers);
-    socket.broadcast.to(user.room).emit('userJoinedVoice', user);
+    socket.broadcast.to(user.room).emit('userJoinedVoice', toPublicConnectedUser(user));
   });
 
   // Drop Mic slot
@@ -10743,8 +11215,7 @@ io.on('connection', (socket) => {
       user.isSpeaking = canBroadcastAudio ? isSpeaking : false;
     }
 
-    const slots = getMicSlotsForRoom(user.room);
-    io.to(user.room).emit('micSlotsUpdated', slots);
+    io.to(user.room).emit('micSlotsUpdated', getPublicMicSlotsForRoom(user.room));
     io.to(user.room).emit('userVoiceStateChanged', {
       userId: user.id,
       isMuted: user.isMuted,
@@ -10770,24 +11241,36 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const target = users.find((u) => u.username.toLowerCase() === targetUsername?.toLowerCase());
-    const regResult = targetUsername ? getRegisteredMember(targetUsername) : null;
+    const cleanTargetUsername = typeof targetUsername === 'string' ? sanitizeText(targetUsername).trim() : '';
+    const target = cleanTargetUsername ? users.find((u) => u.username.toLowerCase() === cleanTargetUsername.toLowerCase()) : undefined;
+    const regResult = cleanTargetUsername ? getRegisteredMember(cleanTargetUsername) : null;
     const offlineMember = regResult?.member;
-    const resolvedTargetName = regResult?.key || target?.username || targetUsername;
+    const resolvedTargetName = regResult?.key || target?.username || cleanTargetUsername;
 
     const readOnlyActions = ['getRoomStats', 'getBannedList', 'getMutedList', 'getMonitorLogs'];
     const actionsWithoutTarget = [
       'unban', 'unmute', 'globalBroadcast', 'broadcastMessage', 'globalClearChat', 'pullAllUsers', 'createRoom', 'editRoom', 'deleteRoom', 
-      'lockRoomChat', 'setSlowMode', 'lockRoomVoice', 'setRoomPassword', 'adminSiren',
+      'lockRoomChat', 'setSlowMode', 'lockRoomVoice', 'setRoomPassword', 'adminSiren', 'toggleDeletedNotice',
       ...readOnlyActions
     ];
 
     if (!target && !offlineMember && !actionsWithoutTarget.includes(action) && action !== 'ban') {
-      socket.emit('systemAlert', `المستخدم [${targetUsername}] غير موجود في قاعدة بيانات الأعضاء.`);
+      socket.emit('systemAlert', `المستخدم [${cleanTargetUsername}] غير موجود في قاعدة بيانات الأعضاء.`);
       return;
     }
 
-    const targetProxy = target ? target : (offlineMember ? { username: resolvedTargetName!, role: offlineMember.role } : undefined);
+    const targetProxy = target ? target : (offlineMember ? { username: resolvedTargetName, role: offlineMember.role } : undefined);
+
+    if (!isSupremeHassan(admin) && cleanTargetUsername && ['ban', 'kick', 'mute', 'muteVoice', 'jailUser', 'deleteAccount', 'updateRole', 'updatePassword'].includes(action)) {
+      if (cleanTargetUsername.toLowerCase() === admin.username.toLowerCase() && ['ban', 'kick', 'mute', 'muteVoice', 'jailUser', 'deleteAccount'].includes(action)) {
+        socket.emit('systemAlert', 'لا يمكنك تطبيق هذا الإجراء على حسابك الشخصي.');
+        return;
+      }
+      if (!targetProxy && (cleanTargetUsername.toLowerCase() === 'hassan' || cleanTargetUsername.toLowerCase() === 'admin')) {
+        socket.emit('systemAlert', 'لا تملك صلاحية تنفيذ هذا الإجراء ضد الإدارة العليا.');
+        return;
+      }
+    }
 
     const isStaffAdmin = isStaffUser(admin);
 
@@ -10953,12 +11436,12 @@ io.on('connection', (socket) => {
             kickedCooldownMap.set(target.ipAddress, cooldownExpiry);
           }
 
-          // Invalidate active session and persistent token
-          if (target.sessionToken) {
-            activeSessions.delete(target.sessionToken);
-          }
-          usernameToSessionMap.delete(target.username.toLowerCase());
-          persistActiveSessions();
+          // Invalidate active session and revoke persistent tokens
+          revokeUserSessionTokens({
+            sessionToken: target.sessionToken,
+            username: target.username,
+            bumpVersion: true
+          });
 
           io.to(target.id).emit('kickedByAdmin', { reason: kickReason, by: admin.username });
           cleanupUserLiveState(target.id);
@@ -10986,7 +11469,7 @@ io.on('connection', (socket) => {
 
       // باند وحظر دائم يشمل عنوان الـ IP وبصمة الجهاز والحسابات المرتبطة (Ban IP, Device Fingerprint & Username)
       case 'ban': {
-        const uName = (targetUsername || target?.username || '').trim();
+        const uName = (resolvedTargetName || cleanTargetUsername || target?.username || '').trim();
         if (!uName) break;
         if (target?.isBot || botEngine.isBotUsername(uName)) {
           socket.emit('systemAlert', 'لا يمكن حظر البوتات نهائياً؛ يمكن للأدمن فقط إيقاف البوت أو حذفه من قسم إدارة البوتات.');
@@ -11214,8 +11697,9 @@ io.on('connection', (socket) => {
 
       // تعديل النقاط (Update Points - Admin Only - للأعضاء المتصلين وغير المتصلين)
       case 'updatePoints': {
-        const uName = (targetUsername || target?.username || '').trim();
-        const pts = Number(value) || 0;
+        const uName = (resolvedTargetName || cleanTargetUsername || target?.username || '').trim();
+        const rawPts = Number(value);
+        const pts = Number.isFinite(rawPts) ? Math.min(100000000, Math.max(0, Math.floor(rawPts))) : 0;
         if (target) {
           target.points = pts;
         }
@@ -11468,8 +11952,9 @@ io.on('connection', (socket) => {
 
       // تعديل اللايكات (Update Likes - للأعضاء المتصلين وغير المتصلين)
       case 'updateLikes': {
-        const uName = (targetUsername || target?.username || '').trim();
-        const lks = Number(value) || 0;
+        const uName = (resolvedTargetName || cleanTargetUsername || target?.username || '').trim();
+        const rawLks = Number(value);
+        const lks = Number.isFinite(rawLks) ? Math.min(100000000, Math.max(0, Math.floor(rawLks))) : 0;
         if (target) {
           target.likes = lks;
         }
@@ -11713,13 +12198,39 @@ io.on('connection', (socket) => {
         regFound.member.password = hashPassword(newPassword);
         saveMembers();
 
-        if (target) {
-          io.to(target.id).emit('systemAlert', `🔑 قامت الإدارة (${admin.username}) بتحديث وتعيين كلمة مرور جديدة لحسابك: [${newPassword}]. يرجى حفظها لاستخدامها عند تسجيل الدخول.`);
+        // Revoke active sessions and disconnect connected sockets so new password takes effect immediately
+        const targetSocketsToDrop: string[] = [];
+        users.forEach((u) => {
+          if (u.username.toLowerCase() === regFound.key.toLowerCase()) {
+            targetSocketsToDrop.push(u.id);
+          }
+        });
+        for (const sess of activeSessions.values()) {
+          if (sess.user?.username?.toLowerCase() === regFound.key.toLowerCase() && sess.currentSocketId) {
+            if (!targetSocketsToDrop.includes(sess.currentSocketId)) {
+              targetSocketsToDrop.push(sess.currentSocketId);
+            }
+          }
         }
+        revokeUserSessionTokens({
+          username: regFound.key,
+          bumpVersion: true
+        });
+        targetSocketsToDrop.forEach((sid) => {
+          io.to(sid).emit('sessionRestoreFailed', {
+            reason: `🔑 قامت الإدارة (${admin.username}) بتحديث كلمة مرور حسابك. يرجى تسجيل الدخول مجدداً بكلمة المرور الجديدة.`
+          });
+          const sObj = io.sockets.sockets.get(sid);
+          if (sObj) {
+            try {
+              sObj.disconnect(true);
+            } catch {}
+          }
+        });
 
         broadcastAllRegisteredMembers();
         logMonitorEvent('role', `قام ${admin.username} بتغيير وتعيين كلمة مرور جديدة لحساب [${regFound.key}]`, admin.username, regFound.key);
-        socket.emit('systemAlert', `✅ تم تغيير وتحديث كلمة مرور العضو [${regFound.key}] بنجاح إلى: ${newPassword}`);
+        socket.emit('systemAlert', `✅ تم تحديث كلمة مرور العضو [${regFound.key}] بنجاح وإبطال الجلسات السابقة.`);
         break;
       }
 
@@ -12042,7 +12553,11 @@ io.on('connection', (socket) => {
                   delete room.bannerUrl;
                 } else {
                   const safeBanner = await ensureMediaUrlNotBase64(cleanBanner);
-                  room.bannerUrl = safeBanner || cleanBanner;
+                  if (safeBanner) {
+                    room.bannerUrl = safeBanner;
+                  } else {
+                    socket.emit('systemAlert', 'رابط أو صيغة بنر الغرفة غير صالحة.');
+                  }
                 }
               }
             }
@@ -12181,6 +12696,26 @@ io.on('connection', (socket) => {
       if (currentRegFound) {
         if (password && String(password).trim().length >= 3 && currentRegFound.member.role !== 'guest') {
           currentRegFound.member.password = hashPassword(String(password).trim());
+          const oldToken = user.sessionToken;
+          const nextVer = bumpMemberTokenVersion(user.username);
+          const refreshedToken = signSessionToken(user.username, nextVer);
+          user.sessionToken = refreshedToken;
+          revokeUserSessionTokens({
+            sessionToken: oldToken,
+            username: user.username,
+            bumpVersion: false,
+            excludeToken: refreshedToken
+          });
+          activeSessions.set(refreshedToken, {
+            sessionToken: refreshedToken,
+            user,
+            currentSocketId: socket.id,
+            lastActiveTime: Date.now(),
+            isExplicitlyLoggedOut: false,
+            tokenVersion: nextVer
+          });
+          usernameToSessionMap.set(user.username.toLowerCase(), refreshedToken);
+          socket.emit('sessionTokenRefreshed', { sessionToken: refreshedToken });
         }
         if (incomingDecoration !== undefined) {
           currentRegFound.member.displayName = user.displayName || user.username;
@@ -12298,9 +12833,23 @@ io.on('connection', (socket) => {
       };
 
       const user = users.find((u) => u.id === socket.id);
-      let resolvedYoutubeVideo = youtubeVideo;
-      if (!resolvedYoutubeVideo && text) {
-        const extractedId = extractYouTubeVideoId(text);
+      const cleanWallInput = sanitizeText(text).slice(0, 6000);
+      let resolvedYoutubeVideo: WallPost['youtubeVideo'] = undefined;
+      if (youtubeVideo && typeof youtubeVideo === 'object') {
+        const rawYtId = sanitizeText(String(youtubeVideo.id || '')).trim();
+        if (/^[a-zA-Z0-9_-]{6,20}$/.test(rawYtId)) {
+          resolvedYoutubeVideo = {
+            id: rawYtId,
+            title: sanitizeText(String(youtubeVideo.title || 'فيديو يوتيوب')).slice(0, 200) || 'فيديو يوتيوب',
+            thumbnail: sanitizeUrl(youtubeVideo.thumbnail) || `https://img.youtube.com/vi/${rawYtId}/hqdefault.jpg`,
+            channelTitle: sanitizeText(String(youtubeVideo.channelTitle || 'YouTube')).slice(0, 100) || 'YouTube',
+            ...(youtubeVideo.duration ? { duration: sanitizeText(String(youtubeVideo.duration)).slice(0, 24) } : {}),
+            url: sanitizeUrl(youtubeVideo.url) || `https://www.youtube.com/watch?v=${rawYtId}`
+          };
+        }
+      }
+      if (!resolvedYoutubeVideo && cleanWallInput) {
+        const extractedId = extractYouTubeVideoId(cleanWallInput);
         if (extractedId) {
           resolvedYoutubeVideo = {
             id: extractedId,
@@ -12312,7 +12861,7 @@ io.on('connection', (socket) => {
         }
       }
 
-      if (!user || (!text?.trim() && !mediaUrl && !resolvedYoutubeVideo)) {
+      if (!user || (!cleanWallInput && !mediaUrl && !resolvedYoutubeVideo)) {
         if (typeof ack === 'function') ack({ ok: false, clientTempId, error: 'تعذر نشر المنشور.' });
         return;
       }
@@ -12340,15 +12889,14 @@ io.on('connection', (socket) => {
           reject(`عفواً، يتطلب نشر وسائط في الحائط ${likesSettings.wallMediaLikes} لايك على الأقل. رصيدك الحالي: ${user.likes} 👍`);
           return;
         }
-        if (!mediaUrl && !resolvedYoutubeVideo && text && likesSettings.wallTextLikes > 0 && user.likes < likesSettings.wallTextLikes) {
+        if (!mediaUrl && !resolvedYoutubeVideo && cleanWallInput && likesSettings.wallTextLikes > 0 && user.likes < likesSettings.wallTextLikes) {
           reject(`عفواً، يتطلب النشر في الحائط ${likesSettings.wallTextLikes} لايك على الأقل. رصيدك الحالي: ${user.likes} 👍`);
           return;
         }
       }
 
-      if (text && serverSecurity.blockExternalLinks && !isSupremeHassan(user) && user.role !== 'admin' && user.role !== 'super') {
-        const cleanWallCheck = sanitizeText(text);
-        const nonYtText = resolvedYoutubeVideo ? cleanWallCheck.replace(/https?:\/\/(?:www\.|m\.)?(?:youtube\.com|youtu\.be)\S*/gi, '') : cleanWallCheck;
+      if (cleanWallInput && serverSecurity.blockExternalLinks && !isSupremeHassan(user) && user.role !== 'admin' && user.role !== 'super') {
+        const nonYtText = resolvedYoutubeVideo ? cleanWallInput.replace(/https?:\/\/(?:www\.|m\.)?(?:youtube\.com|youtu\.be)\S*/gi, '') : cleanWallInput;
         if (/(https?:\/\/|www\.|\.com|\.net|\.org|\.xyz|\.app|\.me|\.online|t\.me|wa\.me)/i.test(nonYtText)) {
           logMonitorEvent('security', `محاولة نشر رابط محظور بالحائط من [${user.username}]`, user.username);
           reject('⚠️ نشر الروابط والإعلانات الخارجية ممنوع منعاً باتاً في شات حسان برو.');
@@ -12357,18 +12905,22 @@ io.on('connection', (socket) => {
       }
 
       let cleanMediaUrl = mediaUrl;
-      let cleanMediaType: 'image' | 'video' | 'audio' = mediaType || 'image';
+      let cleanMediaType: 'image' | 'video' | 'audio' = mediaType && ['image', 'video', 'audio'].includes(mediaType) ? mediaType : 'image';
 
       // If client provided a base64 Data URI, convert and route through Storage Layer
       if (cleanMediaUrl && cleanMediaUrl.startsWith('data:')) {
         try {
+          if (cleanMediaUrl.length > 70 * 1024 * 1024) {
+            reject('حجم الملف يتجاوز 50 ميجابايت.');
+            return;
+          }
           const matches = cleanMediaUrl.match(/^data:([A-Za-z0-9-+\/;=]+);base64,(.+)$/);
           let buffer: Buffer;
           let mime = 'image/jpeg';
           let ext = 'jpg';
           if (matches && matches.length === 3) {
             mime = matches[1].toLowerCase();
-            if (mime.includes('svg') || mime.includes('html') || mime.includes('javascript')) {
+            if (mime.includes('svg') || mime.includes('html') || mime.includes('javascript') || mime.includes('xml')) {
               reject('عفواً، صيغة الملف غير مدعومة لأسباب أمنية.');
               return;
             }
@@ -12385,6 +12937,10 @@ io.on('connection', (socket) => {
             else if (mime.includes('webp')) ext = 'webp';
             else if (mime.includes('gif')) ext = 'gif';
             buffer = Buffer.from(matches[2], 'base64');
+            if (buffer.length > 50 * 1024 * 1024 || !validateMediaMagicBytes(buffer, ext)) {
+              reject('عفواً، محتوى الملف لا يتطابق مع صيغة وسائط صالحة.');
+              return;
+            }
           } else {
             reject('صيغة الوسائط غير صالحة.');
             return;
@@ -12417,8 +12973,7 @@ io.on('connection', (socket) => {
       }
 
       const assignedCategory: 'posts' | 'quick' = category || (cleanMediaUrl || resolvedYoutubeVideo ? 'posts' : 'quick');
-      const cleanWallText = text ? sanitizeText(text) : '';
-      const expandedWallText = cleanWallText ? (shortcutsExpanded ? cleanWallText : expandShortcuts(cleanWallText)) : '';
+      const expandedWallText = cleanWallInput ? (shortcutsExpanded ? cleanWallInput : expandShortcuts(cleanWallInput)) : '';
 
       const newPost: WallPost = {
         id: `post-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -12431,7 +12986,7 @@ io.on('connection', (socket) => {
         text: expandedWallText,
         mediaUrl: cleanMediaUrl,
         mediaType: cleanMediaType,
-        ...(typeof audioDuration === 'number' && audioDuration > 0 ? { audioDuration } : {}),
+        ...(typeof audioDuration === 'number' && Number.isFinite(audioDuration) && audioDuration > 0 ? { audioDuration: Math.min(600, audioDuration) } : {}),
         category: assignedCategory,
         youtubeVideo: resolvedYoutubeVideo,
         time: getCurrentTimeString(),
@@ -12632,17 +13187,21 @@ io.on('connection', (socket) => {
       }
 
       let cleanMedia = mediaUrl;
-      let cleanType: 'image' | 'video' = mediaType || 'image';
+      let cleanType: 'image' | 'video' = mediaType === 'video' ? 'video' : 'image';
 
       if (cleanMedia.startsWith('data:')) {
         try {
+          if (cleanMedia.length > 70 * 1024 * 1024) {
+            socket.emit('systemAlert', 'حجم الملف يتجاوز الحد المسموح به (50 ميجابايت).');
+            return;
+          }
           const matches = cleanMedia.match(/^data:([A-Za-z0-9-+\/;=]+);base64,(.+)$/);
           let buffer: Buffer;
           let mime = 'image/jpeg';
           let ext = 'jpg';
           if (matches && matches.length === 3) {
             mime = matches[1].toLowerCase();
-            if (mime.includes('svg') || mime.includes('html') || mime.includes('javascript')) {
+            if (mime.includes('svg') || mime.includes('html') || mime.includes('javascript') || mime.includes('xml')) {
               socket.emit('systemAlert', 'عفواً، صيغة الملف غير مدعومة لأسباب أمنية.');
               return;
             }
@@ -12653,6 +13212,10 @@ io.on('connection', (socket) => {
             else if (mime.includes('webp')) ext = 'webp';
             else if (mime.includes('gif')) ext = 'gif';
             buffer = Buffer.from(matches[2], 'base64');
+            if (buffer.length > 50 * 1024 * 1024 || !validateMediaMagicBytes(buffer, ext)) {
+              socket.emit('systemAlert', 'محتوى الملف لا يتطابق مع صيغة وسائط صالحة.');
+              return;
+            }
           } else {
             socket.emit('systemAlert', 'صيغة الملف غير صالحة.');
             return;
@@ -12685,7 +13248,7 @@ io.on('connection', (socket) => {
         flag: user.flag,
         mediaUrl: cleanMedia,
         mediaType: cleanType,
-        caption: sanitizeText(caption) || undefined,
+        caption: sanitizeText(caption).slice(0, 500) || undefined,
         createdAt: Date.now(),
         time: getCurrentTimeString(),
         likes: 0,
@@ -12833,9 +13396,9 @@ io.on('connection', (socket) => {
   // Reaction to Chat Message (التفاعل بالإيموجي مع الرسائل - مشترك على مستوى السيرفر لمنع التكرار لكل عضو)
   socket.on('reactChatMessage', ({ messageId, emoji }: { messageId: string; emoji: string }) => {
     const user = users.find((u) => u.id === socket.id);
-    if (!user || !emoji || typeof emoji !== 'string' || emoji.length > 16) return;
+    if (!user || user.isJailed || !emoji || typeof emoji !== 'string' || emoji.length > 16) return;
     const msg = chatHistory.find((m) => m.id === messageId);
-    if (msg) {
+    if (msg && user.room && msg.room === user.room) {
       if (!msg.reactions) msg.reactions = {};
       let reactedMap = messageReactionsUsersMap.get(messageId);
       if (!reactedMap) {
@@ -12887,7 +13450,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Get Active Sessions List (عرض ومراقبة الجلسات النشطة والأجهزة المتصلة)
+  // Get Active Sessions List (عرض ومراقبة الجلسات النشطة والأجهزة المتصلة دون كشف رموز الدخول)
   socket.on('getActiveSessions', () => {
     const admin = users.find((u) => u.id === socket.id);
     if (!admin || (!isSupremeHassan(admin) && admin.role !== 'admin' && admin.role !== 'super' && !hasPermission(admin.role, 'canAccessControlPanel'))) {
@@ -12895,7 +13458,7 @@ io.on('connection', (socket) => {
       return;
     }
     const sessionList = Array.from(activeSessions.values()).map((s) => ({
-      sessionToken: s.sessionToken,
+      sessionId: getOpaqueSessionId(s.sessionToken),
       username: s.user.username,
       role: s.user.role,
       room: s.user.room,
@@ -12910,25 +13473,40 @@ io.on('connection', (socket) => {
   });
 
   // Terminate Active Session (إنهاء وإسقاط جلسة نشطة لجهاز معين)
-  socket.on('terminateSession', ({ sessionToken }: { sessionToken: string }) => {
+  socket.on('terminateSession', ({ sessionId, sessionToken }: { sessionId?: string; sessionToken?: string }) => {
     const admin = users.find((u) => u.id === socket.id);
     if (!admin || (!isSupremeHassan(admin) && admin.role !== 'admin' && admin.role !== 'super' && !hasPermission(admin.role, 'canAccessControlPanel'))) {
       socket.emit('systemAlert', 'إنهاء الجلسات محصور بطاقم الإدارة.');
       return;
     }
-    const sess = activeSessions.get(sessionToken);
-    if (sess) {
+    let resolvedToken = '';
+    let sess: UserSession | undefined;
+    if (typeof sessionId === 'string' && sessionId.trim()) {
+      const targetSid = sessionId.trim();
+      for (const [tok, s] of activeSessions.entries()) {
+        if (getOpaqueSessionId(tok) === targetSid) {
+          resolvedToken = tok;
+          sess = s;
+          break;
+        }
+      }
+    } else if (typeof sessionToken === 'string' && sessionToken.trim()) {
+      const rawTok = sessionToken.trim();
+      sess = activeSessions.get(rawTok);
+      if (sess) resolvedToken = rawTok;
+    }
+    if (sess && resolvedToken) {
       const targetUser = sess.user;
       const targetRole = targetUser?.role || 'member';
       if (!isSupremeHassan(admin) && getRoleLevel(targetRole) >= getRoleLevel(admin.role)) {
         socket.emit('systemAlert', 'لا يمكنك إنهاء جلسة لمستخدم ذو رتبة مساوية أو أعلى منك.');
         return;
       }
-      activeSessions.delete(sessionToken);
-      if (targetUser?.username) {
-        usernameToSessionMap.delete(targetUser.username.toLowerCase());
-      }
-      persistActiveSessions();
+      revokeUserSessionTokens({
+        sessionToken: resolvedToken,
+        username: targetUser?.username,
+        bumpVersion: true
+      });
 
       if (sess.currentSocketId) {
         io.to(sess.currentSocketId).emit('kickedByAdmin', { reason: 'تم إنهاء جلستك من قبل الإدارة.', by: admin.username });
@@ -12944,7 +13522,7 @@ io.on('connection', (socket) => {
 
       // Send updated list
       const sessionList = Array.from(activeSessions.values()).map((s) => ({
-        sessionToken: s.sessionToken,
+        sessionId: getOpaqueSessionId(s.sessionToken),
         username: s.user.username,
         role: s.user.role,
         room: s.user.room,
@@ -12970,18 +13548,25 @@ io.on('connection', (socket) => {
   // Report Chat Message (إبلاغ عن رسالة مخالفة للإدارة)
   socket.on('reportChatMessage', ({ messageId, reportedUser, text, reason }: { messageId: string; reportedUser: string; text?: string; reason?: string }) => {
     const user = users.find((u) => u.id === socket.id);
-    const reporterName = user?.username || 'عضو';
+    if (!user) return;
+    const nowRep = Date.now();
+    const lastRepAt = ((user as any)._lastReportAt as number) || 0;
+    if (nowRep - lastRepAt < 10000) {
+      socket.emit('systemAlert', '⏳ يرجى الانتظار 10 ثوانٍ قبل إرسال بلاغ جديد.');
+      return;
+    }
+    (user as any)._lastReportAt = nowRep;
+    const cleanReported = sanitizeText(reportedUser).slice(0, 60);
+    if (!cleanReported) return;
+    const cleanReason = sanitizeText(reason || 'مخالفة').slice(0, 120) || 'مخالفة';
+    const cleanSnippet = sanitizeText(text || '').slice(0, 80) || 'مرفق وسائط';
     logMonitorEvent(
       'warn',
-      `🚩 بلاغ عن رسالة: [${reporterName}] أبلغ عن [${reportedUser}] - السبب: ${reason || 'مخالفة'} - المحتوى: "${text?.substring(0, 80) || 'مرفق وسائط'}"`,
-      reporterName,
-      reportedUser
+      `🚩 بلاغ عن رسالة: [${user.username}] أبلغ عن [${cleanReported}] - السبب: ${cleanReason} - المحتوى: "${cleanSnippet}"`,
+      user.username,
+      cleanReported
     );
-    users.forEach((u) => {
-      if (isStaffUser(u)) {
-        io.to(u.id).emit('systemAlert', `🚩 بلاغ جديد: @${reporterName} أبلغ عن رسالة لـ @${reportedUser}`);
-      }
-    });
+    emitToAuthorizedStaff('systemAlert', `🚩 بلاغ جديد: @${user.username} أبلغ عن رسالة لـ @${cleanReported}`);
     socket.emit('systemAlert', 'تم استلام بلاغك بنجاح وسيقوم المشرفون بمراجعته فوراً 🛡️');
   });
 
@@ -13217,25 +13802,27 @@ io.on('connection', (socket) => {
   // Reply to Admin Warning (الرد على التنبيه الإداري وكتابة يدوية)
   socket.on('replyToWarning', ({ toUsername, replyText }: { toUsername: string; replyText: string }) => {
     const sender = users.find((u) => u.id === socket.id);
-    if (!sender || !replyText.trim()) return;
+    const cleanTo = sanitizeText(toUsername).trim().slice(0, 60);
+    const cleanReply = sanitizeText(replyText).trim().slice(0, 500);
+    if (!sender || !cleanTo || !cleanReply) return;
+
+    const adminUser = users.find((u) => u.username.toLowerCase() === cleanTo.toLowerCase());
+    if (!adminUser || !isStaffUser(adminUser)) return;
 
     logMonitorEvent(
       'security',
-      `رد العضو [${sender.username}] على التنبيه الإداري من [${toUsername}]: "${replyText}"`,
+      `رد العضو [${sender.username}] على التنبيه الإداري من [${cleanTo}]: "${cleanReply}"`,
       sender.username,
-      toUsername
+      cleanTo
     );
 
-    const adminUser = users.find((u) => u.username.toLowerCase() === toUsername.toLowerCase());
-    if (adminUser) {
-      io.to(adminUser.id).emit('warningReplyReceived', {
-        from: sender.username,
-        avatarUrl: sender.avatarUrl,
-        flag: sender.flag,
-        replyText: sanitizeText(replyText),
-        time: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' })
-      });
-    }
+    io.to(adminUser.id).emit('warningReplyReceived', {
+      from: sender.username,
+      avatarUrl: sender.avatarUrl,
+      flag: sender.flag,
+      replyText: cleanReply,
+      time: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' })
+    });
     socket.emit('systemAlert', 'تم إرسال ردك وتوضيحك للإدارة بنجاح ✔️');
   });
 
@@ -13314,7 +13901,7 @@ io.on('connection', (socket) => {
       if (!recipient && toUsername) {
         recipient = users.find((u) => u.username.toLowerCase() === toUsername.trim().toLowerCase());
       }
-      const clean = sanitizeText(text);
+      const clean = sanitizeText(text).slice(0, 4000);
 
       if (!isSupremeHassan(sender) && sender.role !== 'admin' && sender.role !== 'super') {
         if (clean && likesSettings.pmTextLikes > 0 && sender.likes < likesSettings.pmTextLikes) {
@@ -13332,7 +13919,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const destUsername = recipient ? recipient.username : (toUsername ? toUsername.trim() : '');
+      const destUsername = recipient ? recipient.username : (toUsername ? sanitizeText(toUsername).trim() : '');
       if (!destUsername) {
         if (typeof ack === 'function') ack({ ok: false, clientTempId, error: 'المستلم غير محدد.' });
         return;
@@ -13353,13 +13940,24 @@ io.on('connection', (socket) => {
           : undefined;
 
       const safePmMediaUrl = await ensureMediaUrlNotBase64(mediaUrl);
-      let safePmVoiceNote = voiceNote;
+      let safePmVoiceNote: { audioUrl: string; duration: number } | undefined;
       if (voiceNote?.audioUrl) {
-        safePmVoiceNote = {
-          ...voiceNote,
-          audioUrl: (await ensureMediaUrlNotBase64(voiceNote.audioUrl)) || voiceNote.audioUrl
-        };
+        const resolvedPmAudio = await ensureMediaUrlNotBase64(voiceNote.audioUrl);
+        if (resolvedPmAudio) {
+          safePmVoiceNote = {
+            audioUrl: resolvedPmAudio,
+            duration: Number.isFinite(Number(voiceNote.duration)) ? Math.min(600, Math.max(0, Number(voiceNote.duration))) : 0
+          };
+        }
       }
+
+      const safePmReplyTo = replyTo && typeof replyTo === 'object'
+        ? {
+            id: sanitizeText(String(replyTo.id || '')).slice(0, 80),
+            username: sanitizeText(String(replyTo.username || '')).slice(0, 60),
+            text: sanitizeText(String(replyTo.text || '')).slice(0, 500)
+          }
+        : undefined;
 
       const destBanner = recipient?.nameBannerUrl || targetMemberInfo?.nameBannerUrl;
       const isRecipientBot = Boolean(recipient?.isBot || botEngine.isBotUsername(destUsername));
@@ -13379,7 +13977,7 @@ io.on('connection', (socket) => {
         text: expandedPmText,
         mediaUrl: safePmMediaUrl,
         voiceNote: safePmVoiceNote,
-        replyTo,
+        replyTo: safePmReplyTo,
         time: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
         timestamp: now,
         status: recipient || isRecipientBot ? 'delivered' : 'sent',
@@ -13900,11 +14498,21 @@ io.on('connection', (socket) => {
   // =========================================================================
   socket.on('recordProfileVisit', ({ targetUsername }: { targetUsername: string }) => {
     const visitor = users.find((u) => u.id === socket.id);
-    if (!visitor || !targetUsername) return;
-    if (visitor.username.toLowerCase() === targetUsername.toLowerCase()) return; // Don't count self visits
+    const cleanTarget = sanitizeText(targetUsername).trim();
+    if (!visitor || !cleanTarget) return;
+    if (visitor.username.toLowerCase() === cleanTarget.toLowerCase()) return; // Don't count self visits
 
-    const targetMember = getRegisteredMember(targetUsername)?.member;
+    const targetMember = getRegisteredMember(cleanTarget)?.member;
     if (!targetMember) return;
+
+    const nowVisit = Date.now();
+    if (!(visitor as any)._visitCooldowns) (visitor as any)._visitCooldowns = new Map<string, number>();
+    const visitMap: Map<string, number> = (visitor as any)._visitCooldowns;
+    const lastVisitToTarget = visitMap.get(cleanTarget.toLowerCase()) || 0;
+    if (nowVisit - lastVisitToTarget < 60_000) {
+      return;
+    }
+    visitMap.set(cleanTarget.toLowerCase(), nowVisit);
 
     if (!Array.isArray(targetMember.visitors)) {
       targetMember.visitors = [];
@@ -14284,7 +14892,7 @@ io.on('connection', (socket) => {
             const slot = slots.find((s) => s.slotNumber === slotNum);
             if (slot && (!slot.user || slot.user.id === disconnectedSocketId)) {
               slot.user = null;
-              io.to(slotRoom).emit('micSlotsUpdated', slots);
+              io.to(slotRoom).emit('micSlotsUpdated', getPublicMicSlotsForRoom(slotRoom));
               io.to(slotRoom).emit('userLeftVoice', { userId: disconnectedSocketId, username: uName, slotNumber: slotNum });
               broadcastRoomUsers(slotRoom);
               broadcastRoomsUpdate();
@@ -14378,11 +14986,8 @@ app.post('/api/presence-heartbeat', express.text({ type: 'text/plain', limit: '6
     return res.status(200).json({ ok: false, loggedOut: true });
   }
 
-  const session = activeSessions.get(sessionToken);
-  if (!session || session.isExplicitlyLoggedOut) {
-    return res.status(200).json({ ok: false, loggedOut: true });
-  }
-  if (username && session.user.username.toLowerCase() !== username.toLowerCase()) {
+  const session = resolveVerifiedHttpSession(sessionToken, username);
+  if (!session) {
     return res.status(200).json({ ok: false, loggedOut: true });
   }
 

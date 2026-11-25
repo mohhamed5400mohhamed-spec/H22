@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { PassThrough } from 'stream';
 import { fileURLToPath } from 'url';
 import cloudinaryPkg, { type UploadApiResponse } from 'cloudinary';
 
@@ -171,6 +172,9 @@ export class LocalStorageAdapter implements IStorageAdapter {
 
   async saveBuffer(buffer: Buffer, originalFilename: string, mimeType?: string, folder = ''): Promise<MediaUploadResult> {
     const { extension, mediaType } = this.detectExtensionAndType(originalFilename, mimeType);
+    if (!validateMediaMagicBytes(buffer, extension)) {
+      throw new Error('محتوى الملف لا يتطابق مع صيغة وسائط صالحة (صورة/فيديو/صوت).');
+    }
     const safeFolder = this.sanitizeFolder(folder);
     const safeFilename = `soqoor_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.${extension}`;
     const targetDir = safeFolder ? path.join(this.uploadsDir, safeFolder) : this.uploadsDir;
@@ -212,16 +216,51 @@ export class LocalStorageAdapter implements IStorageAdapter {
     return new Promise((resolve, reject) => {
       let bytesReceived = 0;
       let aborted = false;
+      let signatureVerified = false;
+      const headChunks: Buffer[] = [];
+      let headLen = 0;
+
+      const failAbort = (err: Error) => {
+        if (aborted) return;
+        aborted = true;
+        writeStream.destroy();
+        fs.promises.unlink(targetFilePath).catch(() => {});
+        reject(err);
+      };
+
       stream.on('data', (chunk: Buffer) => {
-        bytesReceived += chunk.length;
-        if (bytesReceived > MAX_STREAM_BYTES && !aborted) {
-          aborted = true;
-          writeStream.destroy();
-          fs.promises.unlink(targetFilePath).catch(() => {});
-          reject(new Error('حجم الملف يتجاوز الحد الأقصى المسموح به (50 ميجابايت).'));
+        if (aborted) return;
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bytesReceived += buf.length;
+        if (bytesReceived > MAX_STREAM_BYTES) {
+          failAbort(new Error('حجم الملف يتجاوز الحد الأقصى المسموح به (50 ميجابايت).'));
+          return;
+        }
+        if (!signatureVerified) {
+          headChunks.push(buf);
+          headLen += buf.length;
+          if (headLen >= 16) {
+            const headBuf = Buffer.concat(headChunks, Math.min(headLen, 64));
+            signatureVerified = true;
+            if (!validateMediaMagicBytes(headBuf, extension)) {
+              failAbort(new Error('محتوى الملف لا يتطابق مع صيغة وسائط صالحة (صورة/فيديو/صوت).'));
+              return;
+            }
+          }
         }
       });
 
+      stream.on('end', () => {
+        if (!aborted && !signatureVerified) {
+          const headBuf = Buffer.concat(headChunks);
+          signatureVerified = true;
+          if (!validateMediaMagicBytes(headBuf, extension)) {
+            failAbort(new Error('محتوى الملف لا يتطابق مع صيغة وسائط صالحة (صورة/فيديو/صوت).'));
+          }
+        }
+      });
+
+      stream.on('error', (err) => failAbort(err instanceof Error ? err : new Error(String(err))));
       stream.pipe(writeStream);
 
       writeStream.on('finish', () => {
@@ -289,6 +328,9 @@ export class ExternalCloudStorageAdapter implements IStorageAdapter {
 
   async saveBuffer(buffer: Buffer, originalFilename: string, mimeType?: string, folder = ''): Promise<MediaUploadResult> {
     const detected = this.localFallback.detectExtensionAndType(originalFilename, mimeType);
+    if (!validateMediaMagicBytes(buffer, detected.extension)) {
+      throw new Error('محتوى الملف لا يتطابق مع صيغة وسائط صالحة (صورة/فيديو/صوت).');
+    }
     const safeFolder = folder ? String(folder).replace(/[^a-zA-Z0-9_-]/g, '') : '';
     const encodedName = encodeURIComponent(originalFilename);
     // If endpoint is set, attempt cloud upload via HTTP POST
@@ -502,11 +544,15 @@ export class CloudinaryStorageAdapter implements IStorageAdapter {
   }
 
   async saveBuffer(buffer: Buffer, originalFilename: string, mimeType?: string, folder = 'hassanpro_chat'): Promise<MediaUploadResult> {
+    const detected = this.localFallback.detectExtensionAndType(originalFilename, mimeType);
+    if (!validateMediaMagicBytes(buffer, detected.extension)) {
+      throw new Error('محتوى الملف لا يتطابق مع صيغة وسائط صالحة (صورة/فيديو/صوت).');
+    }
     if (!this.isConfigured) {
       return this.localFallback.saveBuffer(buffer, originalFilename, mimeType, folder);
     }
 
-    const mediaType = this.detectMediaType(originalFilename, mimeType);
+    const mediaType = detected.mediaType || this.detectMediaType(originalFilename, mimeType);
     const resourceType: 'image' | 'video' | 'raw' | 'auto' = mediaType === 'video' || mediaType === 'audio' ? 'video' : mediaType === 'image' ? 'image' : 'auto';
     const safeBaseName = path.parse(originalFilename).name.replace(/[^a-zA-Z0-9_\u0600-\u06FF-]/g, '_') || 'upload';
     const publicId = `${Date.now()}_${safeBaseName}`;
@@ -543,12 +589,12 @@ export class CloudinaryStorageAdapter implements IStorageAdapter {
 
   async saveStream(stream: NodeJS.ReadableStream, originalFilename: string, mimeType?: string, folder = 'hassanpro_chat'): Promise<MediaUploadResult> {
     // Validate allowed extensions & reject SVG/HTML/JS upfront
-    this.localFallback.detectExtensionAndType(originalFilename, mimeType);
+    const detected = this.localFallback.detectExtensionAndType(originalFilename, mimeType);
     if (!this.isConfigured) {
       return this.localFallback.saveStream(stream, originalFilename, mimeType, folder);
     }
 
-    const mediaType = this.detectMediaType(originalFilename, mimeType);
+    const mediaType = detected.mediaType || this.detectMediaType(originalFilename, mimeType);
     const resourceType: 'image' | 'video' | 'raw' | 'auto' = mediaType === 'video' || mediaType === 'audio' ? 'video' : mediaType === 'image' ? 'image' : 'auto';
     const safeBaseName = path.parse(originalFilename).name.replace(/[^a-zA-Z0-9_\u0600-\u06FF-]/g, '_') || 'upload';
     const publicId = `${Date.now()}_${safeBaseName}`;
@@ -558,6 +604,11 @@ export class CloudinaryStorageAdapter implements IStorageAdapter {
       const result = await new Promise<UploadApiResponse>((resolve, reject) => {
         let settled = false;
         let bytesReceived = 0;
+        let signatureVerified = false;
+        const headChunks: Buffer[] = [];
+        let headLen = 0;
+        const gateStream = new PassThrough();
+
         const uploadStream = cloudinary.uploader.upload_stream(
           this.buildCloudinaryUploadOptions(originalFilename, mimeType, folder, publicId, resourceType),
           (error, res) => {
@@ -574,21 +625,53 @@ export class CloudinaryStorageAdapter implements IStorageAdapter {
         const fail = (err: Error) => {
           if (settled) return;
           settled = true;
+          try { gateStream.destroy(); } catch {}
           try { uploadStream.destroy(); } catch {}
           reject(err);
         };
 
+        gateStream.pipe(uploadStream);
+
         stream.on('data', (chunk: Buffer) => {
-          bytesReceived += chunk.length;
+          if (settled) return;
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          bytesReceived += buf.length;
           if (bytesReceived > MAX_STREAM_BYTES) {
             fail(new Error('حجم الملف يتجاوز الحد الأقصى المسموح به (50 ميجابايت).'));
+            return;
           }
+          if (!signatureVerified) {
+            headChunks.push(buf);
+            headLen += buf.length;
+            if (headLen >= 16) {
+              const combined = Buffer.concat(headChunks);
+              signatureVerified = true;
+              if (!validateMediaMagicBytes(combined, detected.extension)) {
+                fail(new Error('محتوى الملف لا يتطابق مع صيغة وسائط صالحة (صورة/فيديو/صوت).'));
+                return;
+              }
+              gateStream.write(combined);
+            }
+            return;
+          }
+          gateStream.write(buf);
+        });
+        stream.on('end', () => {
+          if (settled) return;
+          if (!signatureVerified) {
+            const combined = Buffer.concat(headChunks);
+            signatureVerified = true;
+            if (!validateMediaMagicBytes(combined, detected.extension)) {
+              fail(new Error('محتوى الملف لا يتطابق مع صيغة وسائط صالحة (صورة/فيديو/صوت).'));
+              return;
+            }
+            if (combined.length > 0) gateStream.write(combined);
+          }
+          gateStream.end();
         });
         stream.on('error', (err) => fail(err instanceof Error ? err : new Error(String(err))));
         stream.on('aborted', () => fail(new Error('تم إلغاء رفع الملف قبل اكتماله.')));
         uploadStream.on('error', (err) => fail(err instanceof Error ? err : new Error(String(err))));
-
-        stream.pipe(uploadStream);
       });
 
       return {
@@ -693,6 +776,45 @@ export class StorageManager {
   public async deleteFile(keyOrUrl: string): Promise<boolean> {
     return this.adapter.deleteFile(keyOrUrl);
   }
+}
+
+export function validateMediaMagicBytes(buffer: Buffer, expectedExt?: string): boolean {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4) return false;
+  const headText = buffer.subarray(0, Math.min(256, buffer.length)).toString('utf8').trimStart().toLowerCase();
+  if (
+    headText.startsWith('<svg') ||
+    headText.startsWith('<?xml') ||
+    headText.startsWith('<!doctype html') ||
+    headText.startsWith('<html') ||
+    headText.startsWith('<script')
+  ) {
+    return false;
+  }
+
+  const b = buffer;
+  const isPng = b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 && b[4] === 0x0d && b[5] === 0x0a && b[6] === 0x1a && b[7] === 0x0a;
+  const isJpg = b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+  const isGif = b.length >= 6 && (b.subarray(0, 6).toString('ascii') === 'GIF87a' || b.subarray(0, 6).toString('ascii') === 'GIF89a');
+  const isWebp = b.length >= 12 && b.subarray(0, 4).toString('ascii') === 'RIFF' && b.subarray(8, 12).toString('ascii') === 'WEBP';
+  const isWav = b.length >= 12 && b.subarray(0, 4).toString('ascii') === 'RIFF' && b.subarray(8, 12).toString('ascii') === 'WAVE';
+  const isWebmOrMkv = b.length >= 4 && b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3;
+  const isOgg = b.length >= 4 && b.subarray(0, 4).toString('ascii') === 'OggS';
+  const isMp4Box = b.length >= 8 && ['ftyp', 'moov', 'mdat', 'wide', 'free'].includes(b.subarray(4, 8).toString('ascii'));
+  const isId3 = b.length >= 3 && b.subarray(0, 3).toString('ascii') === 'ID3';
+  const isMpegFrame = b.length >= 2 && b[0] === 0xff && (b[1] & 0xe0) === 0xe0;
+
+  const ext = (expectedExt || '').toLowerCase();
+  if (ext === 'png') return isPng || isJpg || isWebp;
+  if (ext === 'jpg' || ext === 'jpeg') return isJpg || isPng || isWebp;
+  if (ext === 'gif') return isGif || isWebp || isPng || isJpg;
+  if (ext === 'webp') return isWebp || isPng || isJpg;
+  if (ext === 'wav') return isWav || isOgg || isWebmOrMkv;
+  if (ext === 'ogg') return isOgg || isWav || isWebmOrMkv;
+  if (ext === 'webm' || ext === 'mkv') return isWebmOrMkv || isMp4Box || isOgg;
+  if (ext === 'mp4' || ext === 'mov' || ext === 'm4a') return isMp4Box || isWebmOrMkv || isId3 || isMpegFrame;
+  if (ext === 'mp3' || ext === 'aac') return isId3 || isMpegFrame || isMp4Box || isWebmOrMkv || isOgg || isWav;
+
+  return isPng || isJpg || isGif || isWebp || isWav || isWebmOrMkv || isOgg || isMp4Box || isId3 || isMpegFrame;
 }
 
 export const storageManager = StorageManager.getInstance();

@@ -79,11 +79,12 @@ export function registerBotController({ io, botEngine, users, findSocketUser, lo
       }
     });
 
-    socket.on('updateBot', ({ id, data }) => {
+    socket.on('updateBot', (payload) => {
       const actor = requireAdmin();
       if (!actor) return;
       try {
-        const updated = botEngine.updateBot(id, data || {});
+        const { id, data } = payload && typeof payload === 'object' ? payload : {};
+        const updated = botEngine.updateBot(id, data && typeof data === 'object' ? data : {});
         if (logMonitorEvent) {
           logMonitorEvent('role', `تعديل البوت [${updated.username}] بواسطة ${actor.username}`, actor.username, updated.username);
         }
@@ -93,10 +94,11 @@ export function registerBotController({ io, botEngine, users, findSocketUser, lo
       }
     });
 
-    socket.on('deleteBot', ({ id }) => {
+    socket.on('deleteBot', (payload) => {
       const actor = requireAdmin();
       if (!actor) return;
       try {
+        const { id } = payload && typeof payload === 'object' ? payload : {};
         const removed = botEngine.deleteBot(id);
         if (logMonitorEvent) {
           logMonitorEvent('role', `حذف البوت [${removed.username}] بواسطة ${actor.username}`, actor.username, removed.username);
@@ -107,10 +109,11 @@ export function registerBotController({ io, botEngine, users, findSocketUser, lo
       }
     });
 
-    socket.on('toggleBotEnabled', ({ id, enabled }) => {
+    socket.on('toggleBotEnabled', (payload) => {
       const actor = requireAdmin();
       if (!actor) return;
       try {
+        const { id, enabled } = payload && typeof payload === 'object' ? payload : {};
         const updated = botEngine.toggleBotEnabled(id, enabled);
         socket.emit('botActionResult', {
           success: true,
@@ -122,10 +125,11 @@ export function registerBotController({ io, botEngine, users, findSocketUser, lo
       }
     });
 
-    socket.on('addBotReply', ({ keyword, reply }) => {
+    socket.on('addBotReply', (payload) => {
       const actor = requireAdmin();
       if (!actor) return;
       try {
+        const { keyword, reply } = payload && typeof payload === 'object' ? payload : {};
         const item = botEngine.addBotReply(keyword, reply);
         socket.emit('botActionResult', { success: true, action: 'addReply', message: `تمت إضافة كلمة [${item.keyword}] للبوت ✅`, item });
       } catch (err) {
@@ -133,10 +137,11 @@ export function registerBotController({ io, botEngine, users, findSocketUser, lo
       }
     });
 
-    socket.on('updateBotReply', ({ id, keyword, reply }) => {
+    socket.on('updateBotReply', (payload) => {
       const actor = requireAdmin();
       if (!actor) return;
       try {
+        const { id, keyword, reply } = payload && typeof payload === 'object' ? payload : {};
         const item = botEngine.updateBotReply(id, keyword, reply);
         socket.emit('botActionResult', { success: true, action: 'updateReply', message: `تم تعديل رد كلمة [${item.keyword}] ✅`, item });
       } catch (err) {
@@ -144,10 +149,11 @@ export function registerBotController({ io, botEngine, users, findSocketUser, lo
       }
     });
 
-    socket.on('deleteBotReply', ({ id }) => {
+    socket.on('deleteBotReply', (payload) => {
       const actor = requireAdmin();
       if (!actor) return;
       try {
+        const { id } = payload && typeof payload === 'object' ? payload : {};
         const removed = botEngine.deleteBotReply(id);
         socket.emit('botActionResult', { success: true, action: 'deleteReply', message: `تم حذف كلمة [${removed.keyword}] 🗑️` });
       } catch (err) {

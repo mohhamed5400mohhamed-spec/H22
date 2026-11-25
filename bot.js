@@ -93,6 +93,30 @@ function getPersonalityDescriptor(personality) {
   }
 }
 
+function sanitizeBotText(value, maxLen = 200) {
+  if (value === undefined || value === null) return '';
+  return String(value)
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+    .trim()
+    .slice(0, maxLen);
+}
+
+function sanitizeBotAvatarUrl(value) {
+  const trimmed = String(value || '').trim();
+  if (!trimmed) return '';
+  if (trimmed === DEFAULT_FALLBACK_BOT_AVATAR) return trimmed;
+  if (/^(javascript|vbscript|file):/i.test(trimmed)) return '';
+  if (/^\/(?!\/)/.test(trimmed) || /^https?:\/\//i.test(trimmed)) {
+    return trimmed.slice(0, 1024);
+  }
+  if (/^data:image\/(?:png|jpeg|jpg|webp|gif);base64,/i.test(trimmed)) {
+    return trimmed;
+  }
+  return '';
+}
+
+const RESERVED_BOT_NAMES = new Set(['admin', 'hassan', 'النظام', 'الإدارة', 'إدارة حسان برو', 'نظام الهدايا 🎁']);
+
 export function createBotEngine(ctx) {
   const {
     io,
@@ -1818,16 +1842,22 @@ export function createBotEngine(ctx) {
   }
 
   function createBot(payload) {
-    const cleanName = String(payload.username || '').trim();
-    const avatarUrl = String(payload.avatarUrl || '').trim();
+    if (!payload || typeof payload !== 'object') {
+      throw new Error('بيانات البوت غير صالحة.');
+    }
+    const cleanName = sanitizeBotText(payload.username, 40);
+    const avatarUrl = sanitizeBotAvatarUrl(payload.avatarUrl);
     const status = payload.status;
-    const statusQuote = String(payload.statusQuote || '').trim();
+    const statusQuote = sanitizeBotText(payload.statusQuote, 160);
     const defaultRoom = resolveValidRoom(payload.defaultRoom);
     const personality = payload.personality;
-    const note = String(payload.note || '').trim();
+    const note = sanitizeBotText(payload.note, 300);
 
     if (!cleanName || !avatarUrl || !status || !statusQuote || !defaultRoom || !personality) {
-      throw new Error('جميع الحقول إجبارية ما عدا الملاحظة.');
+      throw new Error('جميع الحقول إجبارية ويجب أن يكون رابط الصورة صالحاً.');
+    }
+    if (RESERVED_BOT_NAMES.has(cleanName.toLowerCase())) {
+      throw new Error('لا يمكن استخدام اسم محجوز للنظام كاسم بوت.');
     }
     if (!['online', 'offline', 'away', 'hidden'].includes(status)) {
       throw new Error('حالة البوت غير صالحة.');
@@ -1844,7 +1874,7 @@ export function createBotEngine(ctx) {
       throw new Error(`يوجد بوت بنفس الاسم [${cleanName}] بالفعل.`);
     }
 
-    const flag = String(payload.flag || '🇸🇦').trim() || '🇸🇦';
+    const flag = sanitizeBotText(payload.flag || '🇸🇦', 12) || '🇸🇦';
 
     const newBot = {
       id: `b-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -1875,21 +1905,27 @@ export function createBotEngine(ctx) {
   }
 
   function updateBot(botId, payload) {
+    if (!payload || typeof payload !== 'object') {
+      throw new Error('بيانات تحديث البوت غير صالحة.');
+    }
     const idx = bots.findIndex((b) => b.id === botId);
     if (idx === -1) throw new Error('البوت غير موجود.');
 
     const prev = bots[idx];
-    const cleanName = String(payload.username ?? prev.username).trim();
-    const avatarUrl = String(payload.avatarUrl ?? prev.avatarUrl).trim();
+    const cleanName = payload.username !== undefined ? sanitizeBotText(payload.username, 40) : prev.username;
+    const avatarUrl = payload.avatarUrl !== undefined ? sanitizeBotAvatarUrl(payload.avatarUrl) : prev.avatarUrl;
     const status = payload.status ?? prev.status;
-    const statusQuote = String(payload.statusQuote ?? prev.statusQuote).trim();
+    const statusQuote = payload.statusQuote !== undefined ? sanitizeBotText(payload.statusQuote, 160) : prev.statusQuote;
     const defaultRoom = resolveValidRoom(payload.defaultRoom ?? prev.defaultRoom);
     const personality = payload.personality ?? prev.personality;
-    const note = payload.note !== undefined ? String(payload.note).trim() : (prev.note || '');
-    const flag = payload.flag !== undefined ? (String(payload.flag).trim() || '🇸🇦') : (prev.flag || '🇸🇦');
+    const note = payload.note !== undefined ? sanitizeBotText(payload.note, 300) : (prev.note || '');
+    const flag = payload.flag !== undefined ? (sanitizeBotText(payload.flag, 12) || '🇸🇦') : (prev.flag || '🇸🇦');
 
     if (!cleanName || !avatarUrl || !status || !statusQuote || !defaultRoom || !personality) {
-      throw new Error('جميع الحقول إجبارية ما عدا الملاحظة.');
+      throw new Error('جميع الحقول إجبارية ويجب أن يكون رابط الصورة صالحاً.');
+    }
+    if (RESERVED_BOT_NAMES.has(cleanName.toLowerCase())) {
+      throw new Error('لا يمكن استخدام اسم محجوز للنظام كاسم بوت.');
     }
     if (!['online', 'offline', 'away', 'hidden'].includes(status)) {
       throw new Error('حالة البوت غير صالحة.');
@@ -2049,8 +2085,8 @@ export function createBotEngine(ctx) {
   }
 
   function addBotReply(keyword, reply) {
-    const cleanKw = String(keyword || '').trim();
-    const cleanReply = String(reply || '').trim();
+    const cleanKw = sanitizeBotText(keyword, 80);
+    const cleanReply = sanitizeBotText(reply, 500);
     if (!cleanKw || !cleanReply) {
       throw new Error('يرجى إدخال الكلمة والرد.');
     }
@@ -2069,8 +2105,8 @@ export function createBotEngine(ctx) {
   function updateBotReply(id, keyword, reply) {
     const item = botReplies.find((r) => r.id === id);
     if (!item) throw new Error('الرد غير موجود.');
-    const cleanKw = String(keyword || '').trim();
-    const cleanReply = String(reply || '').trim();
+    const cleanKw = sanitizeBotText(keyword, 80);
+    const cleanReply = sanitizeBotText(reply, 500);
     if (!cleanKw || !cleanReply) {
       throw new Error('يرجى إدخال الكلمة والرد.');
     }

@@ -424,6 +424,11 @@ export default function App() {
   const [detectedFlag, setDetectedFlag] = useState<string>('🇾🇪');
   const [loginError, setLoginError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [needsAdminSetup, setNeedsAdminSetup] = useState(false);
+  const [adminClaimPassword, setAdminClaimPassword] = useState('');
+  const [showAdminClaimPassword, setShowAdminClaimPassword] = useState(false);
+  const [isClaimingAdmin, setIsClaimingAdmin] = useState(false);
+  const [adminClaimError, setAdminClaimError] = useState<string | null>(null);
 
   // Ghost Login State (الدخول المخفي)
   const [isGhostLogin, setIsGhostLogin] = useState(false);
@@ -3659,6 +3664,9 @@ export default function App() {
     }) => {
       setOnlineCount(data.users ? data.users.length : (data.onlineCount || 0));
       setRosterUsers(data.users || []);
+      if (typeof (data as any).needsAdminSetup === 'boolean') {
+        setNeedsAdminSetup((data as any).needsAdminSetup);
+      }
       if (Array.isArray(data.users)) {
         setAllConnectedUsers(data.users);
       }
@@ -4905,6 +4913,30 @@ export default function App() {
       }
     });
 
+    s.on('adminBootstrapStatus', (d: { needsAdminSetup?: boolean }) => {
+      if (typeof d?.needsAdminSetup === 'boolean') {
+        setNeedsAdminSetup(d.needsAdminSetup);
+      }
+    });
+
+    s.on('sessionTokenRefreshed', ({ sessionToken }: { sessionToken?: string }) => {
+      if (!sessionToken) return;
+      try {
+        localStorage.setItem('soqoor_session_token', sessionToken);
+        const u = currentUserRef.current;
+        if (u) {
+          localStorage.setItem('soqoor_session_username', u.username);
+          syncServiceWorkerSession({
+            sessionToken,
+            username: u.username,
+            room: u.room || 'الغرفة العامة',
+            keepOnline: keepAlivePlayerEnabled,
+            socketConnected: Boolean(s.connected)
+          }).catch(() => {});
+        }
+      } catch {}
+    });
+
     s.on('loginError', (msg: string) => {
       if (!currentUserRef.current) {
         stopSilentAudioKeepAlive('session-end');
@@ -5678,6 +5710,45 @@ export default function App() {
       }
     }
   }, [storiesList]);
+
+  const handleClaimAdmin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const pwd = adminClaimPassword.trim();
+    if (pwd.length < 6) {
+      setAdminClaimError('يجب أن تكون كلمة مرور الإدارة 6 أحرف على الأقل.');
+      return;
+    }
+    setIsClaimingAdmin(true);
+    setAdminClaimError(null);
+    try {
+      const apiBase =
+        (import.meta.env.VITE_SERVER_URL as string)?.trim() ||
+        (import.meta.env.VITE_API_URL as string)?.trim() ||
+        '';
+      const url = apiBase ? `${apiBase.replace(/\/+$/, '')}/api/auth/claim-admin` : '/api/auth/claim-admin';
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pwd })
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json?.ok) {
+        setAdminClaimError(json?.error || 'تعذّر تعيين كلمة مرور الإدارة.');
+        setIsClaimingAdmin(false);
+        return;
+      }
+      setNeedsAdminSetup(false);
+      setAdminClaimPassword('');
+      setActiveTab('member');
+      setUsernameInput('admin');
+      setPasswordInput(pwd);
+      setIsClaimingAdmin(false);
+      showToast('تم تفعيل وتأمين حساب الإدارة الأعلى (admin) بنجاح! يمكنك الدخول الآن.', 'success');
+    } catch {
+      setAdminClaimError('تعذّر الاتصال بالخادم لتعيين كلمة مرور الإدارة.');
+      setIsClaimingAdmin(false);
+    }
+  };
 
   // Automatic Login directly into "الغرفة العامة"
   const handleLogin = async (e?: React.FormEvent) => {
@@ -8391,6 +8462,54 @@ export default function App() {
 
           {/* Login Form (Direct auto-entry to الغرفة العامة) */}
           <div className="p-2.5 sm:p-3 bg-white text-slate-900 border-b border-slate-300 shadow-inner shrink-0">
+            {needsAdminSetup && (
+              <div className="mb-2.5 p-2.5 rounded-lg bg-amber-50 border border-amber-300 text-slate-900 shadow-xs">
+                <div className="flex items-center gap-1.5 text-amber-900 font-black text-xs mb-1">
+                  <ShieldCheck className="w-4 h-4 text-amber-600 shrink-0" />
+                  <span>التهيئة الأولية لحساب الإدارة الأعلى (admin)</span>
+                </div>
+                <p className="text-[11px] text-amber-800/90 leading-snug mb-2">
+                  لحماية التطبيق، حساب الإدارة غير مُفعّل بكلمة مرور افتراضية. أنشئ كلمة مرور قوية لحساب <span className="font-black">admin</span> لمرة واحدة:
+                </p>
+                {adminClaimError && (
+                  <div className="mb-1.5 p-1.5 bg-rose-100 border border-rose-300 text-rose-700 text-[10px] rounded font-bold">
+                    {adminClaimError}
+                  </div>
+                )}
+                <form onSubmit={handleClaimAdmin} className="flex items-center gap-1.5">
+                  <div className="relative flex-1">
+                    <input
+                      type={showAdminClaimPassword ? 'text' : 'password'}
+                      value={adminClaimPassword}
+                      onChange={(e) => {
+                        setAdminClaimPassword(e.target.value);
+                        if (adminClaimError) setAdminClaimError(null);
+                      }}
+                      placeholder="كلمة مرور الإدارة الجديدة (6+ أحرف)..."
+                      minLength={6}
+                      required
+                      autoComplete="new-password"
+                      className="w-full px-2.5 py-1.5 pl-8 border border-amber-300 bg-white rounded text-slate-900 placeholder-slate-400 text-xs font-semibold outline-none focus:border-amber-600 focus:ring-1 focus:ring-amber-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowAdminClaimPassword((v) => !v)}
+                      className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-800"
+                    >
+                      {showAdminClaimPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={isClaimingAdmin}
+                    className="h-[32px] px-3 bg-amber-600 hover:bg-amber-700 disabled:opacity-60 text-white font-bold text-xs rounded shadow cursor-pointer shrink-0"
+                  >
+                    {isClaimingAdmin ? 'جاري...' : 'تعيين وتأمين'}
+                  </button>
+                </form>
+              </div>
+            )}
+
             {loginError && (
               <div className="mb-2 p-1.5 bg-rose-100 border border-rose-300 text-rose-700 text-[11px] rounded font-bold">
                 {loginError}
