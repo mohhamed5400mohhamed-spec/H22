@@ -16202,7 +16202,7 @@ export default function App() {
 
         {/* 7. MEMBER PROFILE MODAL (Matching Screenshots 10 & 11) */}
         {activeDrawer === 'profile' && profileTargetUser && (
-          <div className={`fixed sm:absolute inset-y-0 right-0 w-full sm:w-[86%] sm:max-w-md h-full ${curTheme.drawerBg} text-slate-100 z-40 shadow-2xl border-l ${curTheme.cardBorder} flex flex-col min-h-0 overflow-hidden animate-in slide-in-from-right duration-200 text-right box-border`}>
+          <div className={`absolute inset-y-0 right-0 w-[92%] sm:w-[86%] max-w-md h-full ${curTheme.drawerBg} text-slate-100 z-40 shadow-2xl border-l ${curTheme.cardBorder} flex flex-col min-h-0 overflow-hidden animate-in slide-in-from-right duration-200 text-right box-border`}>
             {/* Header bar with user's name decoration and Close button [ ✖ ] */}
             <div className={`shrink-0 ${curTheme.drawerHeaderBg || curTheme.headerBg} ${curTheme.accentText} pt-[max(0.625rem,env(safe-area-inset-top))] px-3 py-2.5 flex items-center justify-between border-b ${curTheme.headerBorder}`}>
               <span className="font-bold text-sm truncate max-w-[200px]">{getUserDisplayName(profileTargetUser.username, profileTargetUser.displayName)}</span>

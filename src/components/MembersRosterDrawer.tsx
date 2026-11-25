@@ -117,10 +117,10 @@ const MemberRowCard = memo<MemberRowCardProps>(({
     : 'text-slate-400';
 
   const actionBtnClass = bgUrl
-    ? 'bg-black/45 hover:bg-black/65 text-white border border-white/20 backdrop-blur-xs'
+    ? 'bg-black/55 hover:bg-black/75 text-white border border-white/25 backdrop-blur-xs'
     : isLightDrawer
-    ? 'bg-slate-200/80 hover:bg-slate-300 text-slate-800 border border-slate-300/80'
-    : 'bg-slate-800/80 hover:bg-slate-700 text-slate-200 border border-slate-700/80';
+    ? 'bg-slate-200/85 hover:bg-slate-300 text-slate-800 border border-slate-300/80'
+    : 'bg-slate-800/85 hover:bg-slate-700 text-slate-200 border border-slate-700/80';
 
   const presenceTitle = isOffline
     ? 'عضوية غير متصلة (خارج الغرف)'
@@ -140,20 +140,24 @@ const MemberRowCard = memo<MemberRowCardProps>(({
     ? 'في البهو'
     : user.room;
 
+  const hasQuickActions = !isSelf && Boolean((isSameRoom && onMention) || onPrivateChat || (canRevealNicks && onReveal));
+
   const rowInner = (
-    <>
-      <div className="flex items-center gap-2.5 min-w-0 flex-1">
-        <AvatarWithFrame
-          src={user.avatarUrl || falconIcon}
-          alt={user.username}
-          frame={user.avatarFrame}
-          size={isSameRoom ? 'md' : 'sm'}
-          presenceState={isOffline ? 'offline' : user.presenceState}
-          isGhost={user.isGhost}
-          grayscale={isOffline}
-          showPresenceDot
-          presenceTitle={presenceTitle}
-        />
+    <div className="flex items-start justify-between gap-2.5 w-full min-w-0">
+      <div className="flex items-start gap-2.5 min-w-0 flex-1">
+        <div className="shrink-0 pt-0.5">
+          <AvatarWithFrame
+            src={user.avatarUrl || falconIcon}
+            alt={user.username}
+            frame={user.avatarFrame}
+            size={isSameRoom ? 'md' : 'sm'}
+            presenceState={isOffline ? 'offline' : user.presenceState}
+            isGhost={user.isGhost}
+            grayscale={isOffline}
+            showPresenceDot
+            presenceTitle={presenceTitle}
+          />
+        </div>
 
         <div className="min-w-0 flex-1 text-right">
           <div className={`font-bold text-xs ${primaryTextClass} flex items-center gap-1.5 flex-wrap leading-snug`}>
@@ -171,12 +175,12 @@ const MemberRowCard = memo<MemberRowCardProps>(({
                 src={bannerUrl}
                 alt={user.username}
                 title={user.username}
-                className={`${isSameRoom ? 'h-6 max-h-[26px] max-w-[165px] sm:max-w-[205px]' : 'h-5 max-h-[24px] max-w-[145px]'} object-contain drop-shadow-xs select-none inline-block align-middle rounded ${
+                className={`${isSameRoom ? 'h-6 max-h-[26px] max-w-full sm:max-w-[220px]' : 'h-5 max-h-[24px] max-w-full sm:max-w-[195px]'} object-contain drop-shadow-xs select-none inline-block align-middle rounded ${
                   isOffline ? 'opacity-85' : ''
                 }`}
               />
             ) : (
-              <span className="truncate max-w-[175px] sm:max-w-[215px]">{displayName}</span>
+              <span className="truncate max-w-full">{displayName}</span>
             )}
 
             {user.giftBadges && user.giftBadges.length > 1 && (
@@ -211,12 +215,12 @@ const MemberRowCard = memo<MemberRowCardProps>(({
             )}
           </div>
 
-          <div className={`text-[11px] leading-tight mt-0.5 flex items-center gap-1.5 truncate ${secondaryTextClass}`}>
+          <div className={`text-[11px] leading-tight mt-0.5 flex items-center gap-1.5 flex-wrap ${secondaryTextClass}`}>
             <span className="shrink-0 font-semibold">{roleLabel}</span>
             {locationSummary && (
               <>
                 <span aria-hidden="true">·</span>
-                <span className="truncate max-w-[110px]">{locationSummary}</span>
+                <span className="truncate max-w-[165px]">{locationSummary}</span>
               </>
             )}
             {user.isGhost && (
@@ -238,75 +242,79 @@ const MemberRowCard = memo<MemberRowCardProps>(({
           </div>
 
           {cleanStatus && (
-            <div className={`text-[11px] truncate max-w-[210px] sm:max-w-[250px] mt-0.5 ${secondaryTextClass}`}>
+            <div className={`text-[11px] truncate max-w-full mt-0.5 ${secondaryTextClass}`}>
               {cleanStatus}
+            </div>
+          )}
+
+          {hasQuickActions && (
+            <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
+              {!isSelf && isSameRoom && onMention && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onMention();
+                  }}
+                  className={`h-6 px-2 rounded-md inline-flex items-center gap-1 text-[10px] font-bold transition-colors duration-150 cursor-pointer whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 ${actionBtnClass}`}
+                  title={`منشن @${user.username}`}
+                  aria-label={`منشن ${user.username}`}
+                >
+                  <AtSign className="w-3 h-3" />
+                  <span>منشن</span>
+                </button>
+              )}
+
+              {!isSelf && onPrivateChat && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onPrivateChat();
+                  }}
+                  className={`h-6 px-2 rounded-md inline-flex items-center gap-1 text-[10px] font-bold transition-colors duration-150 cursor-pointer whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 ${actionBtnClass}`}
+                  title={`محادثة خاصة مع ${user.username}`}
+                  aria-label={`محادثة خاصة مع ${user.username}`}
+                >
+                  <MessageCircle className="w-3 h-3" />
+                  <span>خاص</span>
+                </button>
+              )}
+
+              {!isSelf && canRevealNicks && onReveal && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onReveal();
+                  }}
+                  className="h-6 px-2 bg-amber-500 hover:bg-amber-400 text-slate-950 text-[10px] font-black rounded-md transition-colors duration-150 cursor-pointer whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300"
+                  title="كشف النكات والآي بي"
+                >
+                  كشف
+                </button>
+              )}
             </div>
           )}
         </div>
       </div>
 
-      <div className="flex items-center gap-1.5 flex-shrink-0">
-        {!isSelf && isSameRoom && onMention && (
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onMention();
-            }}
-            className={`w-8 h-8 rounded-lg flex items-center justify-center transition-colors duration-150 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 ${actionBtnClass}`}
-            title={`منشن @${user.username}`}
-            aria-label={`منشن ${user.username}`}
+      <div
+        className="flex flex-col items-center justify-center min-w-[28px] pt-0.5 leading-none select-none shrink-0"
+        title={countryName || undefined}
+      >
+        <span className="text-base leading-none">{user.flag}</span>
+        {flagNumber && (
+          <span
+            className={`text-[10px] font-bold tabular-nums mt-0.5 leading-none font-mono ${
+              bgUrl ? 'text-amber-300 drop-shadow-xs' : isLightDrawer ? 'text-amber-700' : 'text-amber-400'
+            }`}
           >
-            <AtSign className="w-3.5 h-3.5" />
-          </button>
+            #{flagNumber}
+          </span>
         )}
-
-        {!isSelf && onPrivateChat && (
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onPrivateChat();
-            }}
-            className={`w-8 h-8 rounded-lg flex items-center justify-center transition-colors duration-150 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 ${actionBtnClass}`}
-            title={`محادثة خاصة مع ${user.username}`}
-            aria-label={`محادثة خاصة مع ${user.username}`}
-          >
-            <MessageCircle className="w-3.5 h-3.5" />
-          </button>
-        )}
-
-        {!isSelf && canRevealNicks && onReveal && (
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onReveal();
-            }}
-            className="h-8 px-2 bg-amber-500 hover:bg-amber-400 text-slate-950 text-[10px] font-black rounded-lg transition-colors duration-150 cursor-pointer whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300"
-            title="كشف النكات والآي بي"
-          >
-            كشف
-          </button>
-        )}
-
-        <div
-          className="flex flex-col items-center justify-center min-w-[28px] leading-none select-none flex-shrink-0"
-          title={countryName || undefined}
-        >
-          <span className="text-base leading-none">{user.flag}</span>
-          {flagNumber && (
-            <span
-              className={`text-[10px] font-bold tabular-nums mt-0.5 leading-none font-mono ${
-                bgUrl ? 'text-amber-300 drop-shadow-xs' : isLightDrawer ? 'text-amber-700' : 'text-amber-400'
-              }`}
-            >
-              #{flagNumber}
-            </span>
-          )}
-        </div>
       </div>
-    </>
+    </div>
   );
 
   if (bgUrl) {
@@ -321,7 +329,7 @@ const MemberRowCard = memo<MemberRowCardProps>(({
             onSelect();
           }
         }}
-        className={`grid grid-cols-1 overflow-hidden cursor-pointer relative min-h-[60px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-amber-400 ${
+        className={`grid grid-cols-1 overflow-hidden cursor-pointer relative z-0 min-h-[68px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-amber-400 ${
           isOffline ? 'opacity-90' : ''
         }`}
       >
@@ -329,14 +337,14 @@ const MemberRowCard = memo<MemberRowCardProps>(({
           src={bgUrl}
           alt=""
           aria-hidden="true"
-          className="col-start-1 row-start-1 w-full h-auto max-h-[240px] min-h-full object-cover select-none pointer-events-none"
+          className="col-start-1 row-start-1 w-full h-auto max-h-[220px] min-h-full object-cover select-none pointer-events-none"
           loading="lazy"
         />
         <div
           aria-hidden="true"
-          className="col-start-1 row-start-1 bg-gradient-to-l from-slate-950/90 via-slate-950/65 to-slate-950/80 pointer-events-none"
+          className="col-start-1 row-start-1 bg-gradient-to-b from-slate-950/90 via-slate-950/50 to-slate-950/25 pointer-events-none"
         />
-        <div className="col-start-1 row-start-1 relative z-10 self-center w-full px-3 py-2.5 flex items-center justify-between gap-2 min-w-0">
+        <div className="col-start-1 row-start-1 relative z-10 self-start w-full px-3.5 pt-3 pb-3">
           {rowInner}
         </div>
       </div>
@@ -354,7 +362,7 @@ const MemberRowCard = memo<MemberRowCardProps>(({
           onSelect();
         }
       }}
-      className={`px-3 py-2.5 min-h-[58px] transition-colors duration-150 cursor-pointer flex items-center justify-between gap-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-amber-400 ${
+      className={`relative z-0 px-3.5 py-2.5 min-h-[60px] transition-colors duration-150 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-amber-400 ${
         isSelf
           ? isLightDrawer
             ? 'bg-amber-500/12 hover:bg-amber-500/18'
@@ -438,7 +446,7 @@ export const MembersRosterDrawer: React.FC<MembersRosterDrawerProps> = ({
   const dividerClass = isLightDrawer ? 'divide-slate-200/90' : 'divide-slate-800/60';
   const sectionHeaderClass = `${curTheme.subHeaderBg} ${
     curTheme.subHeaderText || (isLightDrawer ? 'text-slate-800' : curTheme.accentText)
-  } border-y ${curTheme.subHeaderBorder} px-3 py-1.5 text-[11px] font-bold flex items-center justify-between gap-2 sticky top-0 z-20`;
+  } border-y ${curTheme.subHeaderBorder} px-3 py-1.5 text-[11px] font-bold flex items-center justify-between gap-2 sticky top-0 z-30`;
 
   const tabBarContainerClass = isLightDrawer
     ? 'bg-slate-200/80 border border-slate-300/70'
@@ -472,7 +480,7 @@ export const MembersRosterDrawer: React.FC<MembersRosterDrawerProps> = ({
       role="dialog"
       aria-modal="true"
       aria-label="قائمة الأعضاء"
-      className={`absolute inset-y-0 right-0 z-40 h-full w-[88%] sm:w-[390px] md:w-[420px] max-w-full ${curTheme.drawerBg} ${headerTextClass} shadow-2xl border-l ${curTheme.cardBorder} flex flex-col min-h-0 overflow-hidden animate-in slide-in-from-right duration-200`}
+      className={`absolute inset-y-0 right-0 z-40 h-full w-[86%] sm:w-[84%] max-w-[390px] ${curTheme.drawerBg} ${headerTextClass} shadow-2xl border-l ${curTheme.cardBorder} flex flex-col min-h-0 overflow-hidden animate-in slide-in-from-right duration-200`}
     >
       {/* Header */}
       <div
