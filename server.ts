@@ -6011,7 +6011,7 @@ setInterval(() => {
 setInterval(() => {
   let hasChanges = false;
   users.forEach((u) => {
-    const reg = registeredMembers[u.username];
+    const reg = getRegisteredMember(u.username)?.member;
     if (reg) {
       if (!reg.engagement) {
         reg.engagement = getDefaultEngagement();
@@ -6032,6 +6032,24 @@ setInterval(() => {
     saveMembers();
   }
 }, 60000);
+
+// Shared server-wide map for emoji reactions deduplication across all sockets
+const messageReactionsUsersMap = new Map<string, Record<string, string[]>>();
+
+// Server-wide deduplication cache for clientTempId retries across momentary socket reconnects
+const recentClientTempIds = new Map<string, { id: string; ts: number }>();
+const registerClientTempId = (key: string, id: string) => {
+  const now = Date.now();
+  recentClientTempIds.set(key, { id, ts: now });
+  if (recentClientTempIds.size > 500) {
+    for (const [k, v] of recentClientTempIds.entries()) {
+      if (now - v.ts > 60000 || recentClientTempIds.size > 350) {
+        recentClientTempIds.delete(k);
+      }
+      if (recentClientTempIds.size <= 350) break;
+    }
+  }
+};
 
 // Periodic Server Memory Cleanup & Rate Limiter Pruning (every 10 minutes)
 setInterval(() => {
@@ -6090,13 +6108,27 @@ setInterval(() => {
     for (const [key, rl] of ytSearchRateLimitMap.entries()) {
       if (rl.resetAt <= now) ytSearchRateLimitMap.delete(key);
     }
+    for (const [key, rl] of httpRateLimitMap.entries()) {
+      if (rl.resetAt <= now) httpRateLimitMap.delete(key);
+    }
+    for (const [key, entry] of ytSearchCache.entries()) {
+      if (now - entry.ts >= YT_CACHE_TTL_MS) ytSearchCache.delete(key);
+    }
+    for (const [key, entry] of recentClientTempIds.entries()) {
+      if (now - entry.ts > 60_000) recentClientTempIds.delete(key);
+    }
+    if (messageReactionsUsersMap.size > 500) {
+      const activeIds = new Set(chatHistory.map((m) => m.id));
+      for (const msgId of messageReactionsUsersMap.keys()) {
+        if (!activeIds.has(msgId)) {
+          messageReactionsUsersMap.delete(msgId);
+        }
+      }
+    }
   } catch (err) {
     console.warn('[Server Maintenance] Pruning warning:', err);
   }
 }, 10 * 60 * 1000);
-
-// Shared server-wide map for emoji reactions deduplication across all sockets
-const messageReactionsUsersMap = new Map<string, Record<string, string[]>>();
 
 // Socket connection
 io.on('connection', (socket) => {
@@ -10745,21 +10777,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Deduplication cache for clientTempId retries during momentary reconnects
-  const recentClientTempIds = new Map<string, { id: string; ts: number }>();
-  const registerClientTempId = (key: string, id: string) => {
-    const now = Date.now();
-    recentClientTempIds.set(key, { id, ts: now });
-    if (recentClientTempIds.size > 400) {
-      for (const [k, v] of recentClientTempIds.entries()) {
-        if (now - v.ts > 60000 || recentClientTempIds.size > 300) {
-          recentClientTempIds.delete(k);
-        }
-        if (recentClientTempIds.size <= 300) break;
-      }
-    }
-  };
-
   // Chat message event (Broadcast-First: emits immediately before history persistence & batched engagement save)
   socket.on(
     'chatMessage',
@@ -15188,14 +15205,63 @@ async function startServer() {
   const handleShutdown = async (signal?: string) => {
     try {
       console.log(`🛑 Server shutting down (${signal || 'manual'}), committing all pending database writes...`);
+      const pendingFlushOps: Array<Promise<any>> = [];
+
       if (engagementMembersSaveTimer) {
         clearTimeout(engagementMembersSaveTimer);
         engagementMembersSaveTimer = null;
-        await dataManager.saveMembers(registeredMembers).catch(() => {});
+        pendingFlushOps.push(dataManager.saveMembers(registeredMembers).catch(() => {}));
       }
+      if (saveMembersTimer) {
+        clearTimeout(saveMembersTimer);
+        saveMembersTimer = null;
+        pendingFlushOps.push(dataManager.saveMembers(registeredMembers).catch(() => {}));
+      }
+      if (persistSessionsTimer) {
+        clearTimeout(persistSessionsTimer);
+        persistSessionsTimer = null;
+        const sessionsObj: Record<string, UserSession> = {};
+        for (const [token, sess] of activeSessions.entries()) {
+          if (!sess.isExplicitlyLoggedOut) {
+            sessionsObj[token] = sess;
+          }
+        }
+        pendingFlushOps.push(dataManager.saveSessions(sessionsObj).catch(() => {}));
+      }
+      if (saveFlagCountersTimer) {
+        clearTimeout(saveFlagCountersTimer);
+        saveFlagCountersTimer = null;
+        pendingFlushOps.push(dataManager.save('flag_counters', flagCounters).catch(() => {}));
+      }
+      if (saveHistoryTimer) {
+        clearTimeout(saveHistoryTimer);
+        saveHistoryTimer = null;
+        pendingFlushOps.push(dataManager.saveChatHistory(chatHistory).catch(() => {}));
+      }
+      if (saveOfflinePmTimer) {
+        clearTimeout(saveOfflinePmTimer);
+        saveOfflinePmTimer = null;
+        const offlineObj: Record<string, PrivateMessage[]> = {};
+        for (const [key, msgs] of offlinePrivateMessages.entries()) {
+          if (msgs && msgs.length > 0) offlineObj[key] = msgs;
+        }
+        pendingFlushOps.push(dataManager.saveOfflinePrivateMessages(offlineObj).catch(() => {}));
+      }
+      if (savePrivateChatHistoryTimer) {
+        clearTimeout(savePrivateChatHistoryTimer);
+        savePrivateChatHistoryTimer = null;
+        const pmHistoryObj: Record<string, PrivateMessage[]> = {};
+        const maxRetention = Math.max(1, messageRetentionLimits.privateMaxMessages || 100);
+        for (const [pairKey, msgs] of privateChatHistory.entries()) {
+          if (msgs && msgs.length > 0) pmHistoryObj[pairKey] = msgs.slice(-maxRetention);
+        }
+        pendingFlushOps.push(dataManager.savePrivateChatHistory(pmHistoryObj).catch(() => {}));
+      }
+
       saveAuditLogs(true);
       saveMonitoredWords();
       saveMessageRetentionLimits();
+      await Promise.all(pendingFlushOps);
       await dataManager.flush();
       io.close();
       httpServer.close();

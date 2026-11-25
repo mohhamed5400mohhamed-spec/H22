@@ -516,12 +516,20 @@ self.addEventListener('fetch', (event) => {
                 .catch(() => {});
             } else {
               const resForSizeCheck = netRes.clone();
+              const cachedStatus = netRes.status;
+              const cachedStatusText = netRes.statusText;
+              const cachedHeaders = new Headers(netRes.headers);
               resForSizeCheck
                 .arrayBuffer()
                 .then((buf) => {
                   if (buf.byteLength <= MAX_MEDIA_CACHE_BYTES) {
+                    const responseToCache = new Response(buf, {
+                      status: cachedStatus,
+                      statusText: cachedStatusText,
+                      headers: cachedHeaders
+                    });
                     return cache
-                      .put(req, netRes.clone())
+                      .put(req, responseToCache)
                       .then(() => pruneCacheIfNeeded(SW_MEDIA_CACHE, MAX_MEDIA_CACHE_ENTRIES));
                   }
                 })

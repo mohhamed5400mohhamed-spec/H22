@@ -13,14 +13,17 @@ export class SocketFloodGuard {
   private buckets = new Map<string, RateBucket>();
   private bannedUntil = new Map<string, number>();
 
+  private readonly maxBuckets = 10000;
+
   // Default configuration: max 25 actions per 3-second window per socket
   constructor(
     private capacity: number = 25,
     private refillRatePerSec: number = 8,
     private cooldownPenaltyMs: number = 4000
   ) {
-    // Auto-prune stale buckets every 5 minutes
-    setInterval(() => this.cleanup(), 5 * 60 * 1000);
+    // Auto-prune stale buckets every 5 minutes without keeping the event loop alive
+    const timer = setInterval(() => this.cleanup(), 5 * 60 * 1000);
+    timer.unref?.();
   }
 
   /**
@@ -40,6 +43,13 @@ export class SocketFloodGuard {
 
     let bucket = this.buckets.get(identifier);
     if (!bucket) {
+      if (this.buckets.size >= this.maxBuckets) {
+        this.cleanup();
+        if (this.buckets.size >= this.maxBuckets) {
+          const oldestKey = this.buckets.keys().next().value;
+          if (oldestKey !== undefined) this.buckets.delete(oldestKey);
+        }
+      }
       bucket = {
         tokens: this.capacity,
         lastRefill: now,

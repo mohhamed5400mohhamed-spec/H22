@@ -4451,10 +4451,11 @@ export default function App() {
 
     // User presence state listener (🟢 Green: online, 🟡 Yellow: away/background, ⚪ Gray: offline)
     s.on('userPresenceUpdated', ({ username, state }: { userId: string; username: string; state: 'online' | 'away' | 'offline' }) => {
+      const lowerTarget = (username || '').trim().toLowerCase();
       setRosterUsers((prev) =>
         state === 'offline'
-          ? prev.filter((u) => u.username !== username)
-          : prev.map((u) => (u.username === username ? { ...u, presenceState: state } : u))
+          ? prev.filter((u) => u.username.trim().toLowerCase() !== lowerTarget)
+          : prev.map((u) => (u.username.trim().toLowerCase() === lowerTarget ? { ...u, presenceState: state } : u))
       );
   setAllConnectedUsers((prev) =>
   state === 'offline'
@@ -4484,10 +4485,12 @@ export default function App() {
         return;
       }
       if (Array.isArray(newMsgs) && newMsgs.length > 0) {
+        const limit = Math.max(1, messageRetentionLimitsRef.current?.roomMaxMessages || 200);
         setMessages((prev) => {
           const ids = new Set(prev.map((m) => m.id));
-          const additions = newMsgs.filter((m) => !ids.has(m.id));
-          return additions.length > 0 ? [...prev, ...additions] : prev;
+          const additions = newMsgs.filter((m) => m && !ids.has(m.id));
+          if (additions.length === 0) return prev;
+          return pruneMessagesByRoomLimit([...prev, ...additions], limit);
         });
       }
     });

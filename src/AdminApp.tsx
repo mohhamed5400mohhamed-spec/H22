@@ -204,9 +204,14 @@ export default function AdminApp() {
   });
 
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+    }
     setToast({ message, type });
-    setTimeout(() => {
+    toastTimerRef.current = setTimeout(() => {
+      toastTimerRef.current = null;
       setToast((prev) => (prev?.message === message ? null : prev));
     }, 4000);
   };
@@ -307,6 +312,13 @@ export default function AdminApp() {
       }
     };
 
+    let restoreFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    if (isRestoring) {
+      restoreFallbackTimer = setTimeout(() => {
+        setIsRestoring(false);
+      }, 8000);
+    }
+
     s.on('connect', () => {
       setIsConnected(true);
       try {
@@ -315,6 +327,10 @@ export default function AdminApp() {
         const savedRoom = localStorage.getItem('soqoor_last_room') || 'الغرفة العامة';
         if (token && uname) {
           setIsRestoring(true);
+          if (restoreFallbackTimer) clearTimeout(restoreFallbackTimer);
+          restoreFallbackTimer = setTimeout(() => {
+            setIsRestoring(false);
+          }, 8000);
           s.emit('restoreSession', {
             sessionToken: token,
             username: uname,
@@ -524,6 +540,8 @@ export default function AdminApp() {
     });
 
     return () => {
+      if (restoreFallbackTimer) clearTimeout(restoreFallbackTimer);
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
       s.disconnect();
     };
   }, []);

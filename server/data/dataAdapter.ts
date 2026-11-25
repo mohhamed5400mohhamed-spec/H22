@@ -167,7 +167,8 @@ export class LocalJsonDataDriver implements IDataDriver {
   }
 
   private getFilePath(collection: string): string {
-    const safeName = collection.endsWith('.json') ? collection : `${collection}.json`;
+    const cleanBase = path.basename(String(collection || 'collection').replace(/[^a-zA-Z0-9_.-]/g, '_')) || 'collection';
+    const safeName = cleanBase.endsWith('.json') ? cleanBase : `${cleanBase}.json`;
     return path.join(this.baseDir, safeName);
   }
 
@@ -289,6 +290,10 @@ export class CloudRemoteDataDriver implements IDataDriver {
     } catch {}
   }
 
+  setBatchWriteIntervalMs(ms: number): void {
+    this.localFallback.setBatchWriteIntervalMs(ms);
+  }
+
   async flush(): Promise<void> {
     await this.localFallback.flush();
   }
@@ -407,6 +412,7 @@ export class MongoDbDataDriver implements IDataDriver {
   private lastSavedSerialized = new Map<string, string>();
   private batchDelayMs = 1200;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private isConnecting: boolean = false;
   private readyPromise: Promise<boolean>;
   private readyResolve: ((val: boolean) => void) | null = null;
   private hydrationListeners: Array<() => void> = [];
@@ -475,6 +481,7 @@ export class MongoDbDataDriver implements IDataDriver {
       this.pendingSaves.delete(collection);
       if (this.isConnected && this.db && this.memoryCache.has(collection)) {
         const data = this.memoryCache.get(collection);
+        const targetSeq = this.dirtySeqByCollection.get(collection) || 0;
         const col = this.db.collection('app_collections');
         promises.push(
           col.updateOne(
@@ -482,6 +489,11 @@ export class MongoDbDataDriver implements IDataDriver {
             { $set: { data, updatedAt: new Date() } },
             { upsert: true }
           )
+            .then(() => {
+              if (targetSeq > 0) {
+                this.savedSeqByCollection.set(collection, targetSeq);
+              }
+            })
             .catch((err) => console.error(`[Data Layer - MongoDB] Error flushing "${collection}":`, err))
             .finally(() => this.resolveQueued(collection))
         );
@@ -490,39 +502,49 @@ export class MongoDbDataDriver implements IDataDriver {
       }
     }
     await Promise.all(promises);
-    if (!this.isConnected) {
-      await this.localFallback.flush();
-    }
+    await this.localFallback.flush();
+  }
+
+  private scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.initConnection();
+    }, 15000);
+    this.reconnectTimer.unref?.();
   }
 
   private async initConnection() {
+    if (this.isConnecting) return;
+    this.isConnecting = true;
     try {
       if (this.client) {
         try {
+          this.client.removeAllListeners();
           await this.client.close();
         } catch {}
       }
-      this.client = new MongoClient(this.uri, {
+      const client = new MongoClient(this.uri, {
         serverSelectionTimeoutMS: 5000,
         connectTimeoutMS: 8000,
         maxPoolSize: 10,
         minPoolSize: 1,
         compressors: ['zlib']
       });
-      this.client.on('close', () => {
-        this.isConnected = false;
-      });
-      this.client.on('topologyClosed', () => {
-        this.isConnected = false;
-        if (!this.reconnectTimer) {
-          this.reconnectTimer = setTimeout(() => {
-            this.reconnectTimer = null;
-            this.initConnection();
-          }, 15000);
+      this.client = client;
+      client.on('close', () => {
+        if (this.client === client) {
+          this.isConnected = false;
         }
       });
-      await this.client.connect();
-      this.db = this.client.db(this.dbName);
+      client.on('topologyClosed', () => {
+        if (this.client === client) {
+          this.isConnected = false;
+          this.scheduleReconnect();
+        }
+      });
+      await client.connect();
+      this.db = client.db(this.dbName);
       this.isConnected = true;
       const maskedUri = this.uri.replace(/:[^:]*@/, ':***@');
       console.log(`[Data Layer - MongoDB] ✅ Successfully connected to MongoDB: ${maskedUri} (Database: "${this.dbName}")`);
@@ -536,12 +558,9 @@ export class MongoDbDataDriver implements IDataDriver {
         this.readyResolve(false);
         this.readyResolve = null;
       }
-      if (!this.reconnectTimer) {
-        this.reconnectTimer = setTimeout(() => {
-          this.reconnectTimer = null;
-          this.initConnection();
-        }, 15000);
-      }
+      this.scheduleReconnect();
+    } finally {
+      this.isConnecting = false;
     }
   }
 

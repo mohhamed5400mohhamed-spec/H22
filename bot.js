@@ -2259,6 +2259,33 @@ export function createBotEngine(ctx) {
     }
   }
 
+  function pruneStaleBotMaps() {
+    const now = Date.now();
+    for (const [k, ts] of welcomeCooldowns.entries()) {
+      if (now - ts > 15 * 60 * 1000) welcomeCooldowns.delete(k);
+    }
+    for (const [k, ts] of replyCooldowns.entries()) {
+      if (now - ts > 15 * 60 * 1000) replyCooldowns.delete(k);
+    }
+    for (const [k, until] of ambientSilenceUntil.entries()) {
+      if (now >= until) ambientSilenceUntil.delete(k);
+    }
+    for (const [k, ts] of roomAmbientLastReplyAt.entries()) {
+      if (now - ts > 10 * 60 * 1000) roomAmbientLastReplyAt.delete(k);
+    }
+    for (const [k, ts] of roomLastBotHopArrivalAt.entries()) {
+      if (now - ts > 10 * 60 * 1000) roomLastBotHopArrivalAt.delete(k);
+    }
+    for (const [k, conv] of activeConversations.entries()) {
+      if (!conv || now - (Number(conv.updatedAt) || 0) > ACTIVE_CONVERSATION_TTL_MS) {
+        activeConversations.delete(k);
+      }
+    }
+  }
+
+  const botCleanupInterval = setInterval(pruneStaleBotMaps, 5 * 60 * 1000);
+  botCleanupInterval.unref?.();
+
   // Initial load on module startup
   rehydrateFromStorage(true);
 
