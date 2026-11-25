@@ -113,6 +113,7 @@ import {
 } from './constants/membershipDesigns';
 import { RoomBannerCard } from './components/RoomBannerCard';
 import { CustomEmojiPickerPopover } from './components/CustomEmojiPickerPopover';
+import { MembersRosterDrawer } from './components/MembersRosterDrawer';
 import type { ChatQualitySettings } from './types/chat';
 import {
   DEFAULT_CHAT_QUALITY_SETTINGS,
@@ -7256,6 +7257,25 @@ export default function App() {
 
     const searchLower = searchUserQuery.trim().toLowerCase();
     const myLower = currentUser.username.trim().toLowerCase();
+    const matchesSearchQuery = (entry: {
+      username: string;
+      displayName?: string;
+      statusQuote?: string;
+      room?: string;
+    }) => {
+      if (!searchLower) return true;
+      const uname = entry.username.trim().toLowerCase();
+      const dname = getUserDisplayName(entry.username, entry.displayName).trim().toLowerCase();
+      const quote = (entry.statusQuote || '').trim().toLowerCase();
+      const rm = (entry.room || '').trim().toLowerCase();
+      return (
+        uname.includes(searchLower) ||
+        dname.includes(searchLower) ||
+        quote.includes(searchLower) ||
+        rm.includes(searchLower)
+      );
+    };
+
     const sortByRole = <T extends { role?: string; username: string }>(users: T[]) =>
       [...users].sort((a, b) => {
         const roleDifference = getRoleLevel(b.role) - getRoleLevel(a.role);
@@ -7269,9 +7289,7 @@ export default function App() {
       ? []
       : sortByRole(
           rosterUsers.filter(
-            (u) =>
-              canViewerSeeUser(u) &&
-              (!searchLower || u.username.toLowerCase().includes(searchLower))
+            (u) => canViewerSeeUser(u) && matchesSearchQuery(u)
           )
         );
 
@@ -7309,7 +7327,7 @@ export default function App() {
       if (u.presenceState === 'offline' && !u.isBot) continue;
       if (seenOtherUsernames.has(lowerName)) continue;
       seenOtherUsernames.add(lowerName);
-      if (searchLower && !lowerName.includes(searchLower)) continue;
+      if (!matchesSearchQuery(u)) continue;
       otherFiltered.push(u);
     }
 
@@ -7336,7 +7354,12 @@ export default function App() {
         const lowerName = m.username.trim().toLowerCase();
         if (lowerName === myLower) return false;
         if (currentRoomUserSet.has(lowerName) || seenOtherUsernames.has(lowerName)) return false;
-        return !searchLower || lowerName.includes(searchLower);
+        return matchesSearchQuery({
+          username: m.username,
+          displayName: m.displayName,
+          statusQuote: m.statusQuote,
+          room: m.currentRoom
+        });
       })
     );
 
@@ -7354,7 +7377,8 @@ export default function App() {
     allConnectedUsers,
     allRegisteredMembers,
     canViewerSeeUser,
-    getRoleLevel
+    getRoleLevel,
+    userDisplayNameMap
   ]);
 
   // Open profile modal by username directly (O(1) map lookup)
@@ -13818,653 +13842,40 @@ export default function App() {
           </div>
         )}
 
-        {/* 2. USERS DRAWER (Screenshot 1: المتواجدون) */}
+        {/* 2. USERS DRAWER (قائمة الأعضاء المتواجدين والمسجلين) */}
         {activeDrawer === 'users' && (
-          <div className={`absolute inset-y-0 right-0 w-[84%] ${curTheme.drawerBg} text-slate-100 z-40 shadow-2xl border-l ${curTheme.cardBorder} flex flex-col animate-in slide-in-from-right duration-200`}>
-            <div className={`${curTheme.drawerHeaderBg || curTheme.headerBg} ${curTheme.accentText} p-2 flex items-center justify-between border-b ${curTheme.headerBorder}`}>
-              <span className="font-bold text-sm">المتواجدين</span>
-              <button
-                onClick={() => setActiveDrawer('none')}
-                className="w-7 h-7 bg-red-600 hover:bg-red-700 text-white flex items-center justify-center rounded font-bold cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Search Box (Screenshot 1: البحث ..) */}
-            <div className={`p-1.5 ${curTheme.subHeaderBg} border-b ${curTheme.subHeaderBorder}`}>
-              <div className="relative">
-                <input
-                  type="text"
-                  placeholder="البحث .."
-                  value={searchUserQuery}
-                  onChange={(e) => setSearchUserQuery(e.target.value)}
-                  className={`w-full px-3 py-1.5 ${curTheme.cardBg} text-white border ${curTheme.cardBorder} rounded text-xs outline-none`}
-                />
-                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
-              </div>
-            </div>
-
-            {/* Section 1: المتواجدين في نفس الغرفة الحالية أو بهو الشات العام */}
-            {(() => {
-              const {
-                isCurrentUserOutside,
-                currentRoomUsers,
-                otherConnectedUsers,
-                offlineMembers
-              } = rosterDrawerLists;
-
-              return (
-                <div className="flex-1 overflow-y-auto divide-y divide-slate-800/40">
-                  {/* Header: متواجدون بالغرفة الحالية أو ببهو الشات */}
-                  <div className={`${curTheme.subHeaderBg} ${curTheme.accentText} text-[11px] font-bold px-2.5 py-1 flex items-center justify-between border-b ${curTheme.subHeaderBorder}`}>
-                    <span>
-                      {!isCurrentUserOutside
-                        ? `المتواجدون معك في الغرفة (${currentUser.room}) (${currentRoomUsers.length})`
-                        : `المتواجدون الآن في الشات والبهو (${otherConnectedUsers.length})`}
-                    </span>
-                    <span className="text-[10px] text-emerald-400 font-normal">● متصلون الآن</span>
-                  </div>
-
-                  {/* List of current room users (if inside a room) */}
-                  {!isCurrentUserOutside && currentRoomUsers.map((u) => {
-                    const bgUrl = resolveMemberBgUrl(u.memberBg || u.profileBg);
-                    const rowInner = (
-                      <>
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          <AvatarWithFrame
-                            src={u.avatarUrl || falconIcon}
-                            alt={u.username}
-                            frame={u.avatarFrame}
-                            size="md"
-                            presenceState={u.presenceState}
-                            isGhost={u.isGhost}
-                            showPresenceDot
-                          />
-                          <div className="min-w-0 text-right">
-                            <div className={`font-bold text-xs ${bgUrl ? 'text-white drop-shadow' : curTheme.accentText} flex items-center gap-1 flex-wrap`}>
-                              {u.giftBadges && u.giftBadges.length > 0 && (
-                                <img
-                                  src={u.giftBadges[0]}
-                                  alt="هدية"
-                                  title="هدية تكريمية مرافقة للاسم"
-                                  className="w-4 h-4 sm:w-5 sm:h-5 object-contain inline-block drop-shadow-xs shrink-0 select-none align-middle"
-                                />
-                              )}
-                              {(() => {
-                                const banner = getUserBanner(u.username, u.nameBannerUrl);
-                                if (banner) {
-                                  return (
-                                    <img
-                                      src={banner}
-                                      alt={u.username}
-                                      title={u.username}
-                                      className="h-6 max-h-[26px] max-w-[170px] sm:max-w-[210px] object-contain drop-shadow-sm select-none inline-block align-middle rounded"
-                                    />
-                                  );
-                                }
-                                return <span>{getUserDisplayName(u.username, u.displayName)}</span>;
-                              })()}
-                              {u.giftBadges && u.giftBadges.length > 1 && (
-                                <span className="inline-flex items-center gap-0.5 mx-0.5 align-middle">
-                                  {u.giftBadges.slice(1).map((badgeUrl, bIdx) => (
-                                    <img
-                                      key={bIdx}
-                                      src={badgeUrl}
-                                      alt="وسام"
-                                      title="وسام شرفي وهدية تكريمية"
-                                      className="w-3.5 h-3.5 object-contain inline-block drop-shadow-xs opacity-90"
-                                    />
-                                  ))}
-                                </span>
-                              )}
-                              {u.isGhost && <span className="text-[10px] text-purple-400 font-bold bg-purple-950/70 px-1.5 py-0.2 rounded border border-purple-500/50">👻 مخفي</span>}
-                              {isUserIgnored(u.username) && (
-                                <span className="px-1.5 py-0.2 rounded bg-rose-950 text-rose-300 text-[9px] font-black">
-                                  🚫 متجاهل
-                                </span>
-                              )}
-                            </div>
-                            {u.statusQuote && u.statusQuote.trim() !== '..' && u.statusQuote.trim() !== '' && (
-                              <div className={`text-[11px] truncate max-w-[200px] sm:max-w-[260px] mt-0.5 ${bgUrl ? 'text-slate-100 drop-shadow-xs' : 'text-slate-400'}`}>
-                                {u.statusQuote}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-2 flex-shrink-0">
-                          {(currentUser.role === 'hassan' || currentUser.role === 'admin' || currentUser.role === 'super' || getRoleLevel(currentUser.role) >= 75) && (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                socket?.emit('revealNicks', { targetUsername: u.username });
-                              }}
-                              className="px-2 py-1 bg-amber-500 hover:bg-amber-600 text-black text-[10px] font-black rounded shadow-xs transition-colors cursor-pointer"
-                              title="كشف النكات والآي بي"
-                            >
-                              كشف
-                            </button>
-                          )}
-                          <div
-                            className="flex flex-col items-center justify-center leading-none select-none flex-shrink-0"
-                            title={getCountryNameFromFlag(u.flag) || undefined}
-                          >
-                            <span className="text-lg leading-none">{u.flag}</span>
-                            {getUserFlagNumber(u.username, u.flagNumber) && (
-                              <span className="text-[9px] font-black text-amber-400 bg-slate-900/80 border border-amber-500/40 px-1 py-[1px] rounded mt-0.5 leading-none font-mono">
-                                #{getUserFlagNumber(u.username, u.flagNumber)}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      </>
-                    );
-
-                    if (bgUrl) {
-                      return (
-                        <div
-                          key={u.id}
-                          onClick={() => openUserProfile(u)}
-                          className="grid grid-cols-1 overflow-hidden cursor-pointer relative"
-                        >
-                          <img
-                            src={bgUrl}
-                            alt=""
-                            aria-hidden="true"
-                            className="col-start-1 row-start-1 w-full h-auto max-h-[260px] min-h-full object-cover select-none pointer-events-none"
-                            loading="lazy"
-                          />
-                          <div
-                            aria-hidden="true"
-                            className="col-start-1 row-start-1 bg-gradient-to-b from-slate-950/90 via-slate-950/35 to-transparent pointer-events-none"
-                          />
-                          <div className="col-start-1 row-start-1 relative z-10 self-start w-full p-2 flex items-start justify-between gap-2 min-w-0">
-                            {rowInner}
-                          </div>
-                        </div>
-                      );
-                    }
-
-                    return (
-                      <div
-                        key={u.id}
-                        onClick={() => openUserProfile(u)}
-                        className="p-2 hover:bg-white/5 transition-colors cursor-pointer flex items-center justify-between"
-                      >
-                        {rowInner}
-                      </div>
-                    );
-                  })}
-
-                  {/* If outside rooms: render all online users right here under Header 1 */}
-                  {isCurrentUserOutside && otherConnectedUsers.map((u) => {
-                    const isOtherOutside = !u.room || u.room === 'خارج الغرف' || u.room.trim() === '';
-                    const isSelf = u.username.trim().toLowerCase() === currentUser.username.trim().toLowerCase();
-                    const bgUrl = resolveMemberBgUrl(u.memberBg || u.profileBg);
-                    const rowInner = (
-                      <>
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          <AvatarWithFrame
-                            src={u.avatarUrl || falconIcon}
-                            alt={u.username}
-                            frame={u.avatarFrame}
-                            size="sm"
-                            presenceState={u.presenceState}
-                            isGhost={u.isGhost}
-                            showPresenceDot
-                            presenceTitle={isOtherOutside ? 'متواجد في بهو الشات (خارج الغرف) 🟢' : `متصل بغرفة (${u.room}) 🟢`}
-                          />
-                          <div className="min-w-0 text-right">
-                            <div className={`font-bold text-xs ${bgUrl ? 'text-white drop-shadow' : curTheme.accentText} flex items-center gap-1 flex-wrap`}>
-                              {u.giftBadges && u.giftBadges.length > 0 && (
-                                <img
-                                  src={u.giftBadges[0]}
-                                  alt="هدية"
-                                  title="هدية تكريمية مرافقة للاسم"
-                                  className="w-4 h-4 sm:w-5 sm:h-5 object-contain inline-block drop-shadow-xs shrink-0 select-none align-middle"
-                                />
-                              )}
-                              {(() => {
-                                const banner = getUserBanner(u.username, u.nameBannerUrl);
-                                if (banner) {
-                                  return (
-                                    <img
-                                      src={banner}
-                                      alt={u.username}
-                                      title={u.username}
-                                      className="h-5 max-h-[24px] max-w-[150px] object-contain drop-shadow-sm select-none inline-block align-middle rounded"
-                                    />
-                                  );
-                                }
-                                return <span>{getUserDisplayName(u.username, u.displayName)}</span>;
-                              })()}
-                              {u.giftBadges && u.giftBadges.length > 1 && (
-                                <span className="inline-flex items-center gap-0.5 mx-0.5 align-middle">
-                                  {u.giftBadges.slice(1).map((badgeUrl, bIdx) => (
-                                    <img
-                                      key={bIdx}
-                                      src={badgeUrl}
-                                      alt="وسام"
-                                      title="وسام شرفي"
-                                      className="w-3.5 h-3.5 object-contain inline-block drop-shadow-xs opacity-90"
-                                    />
-                                  ))}
-                                </span>
-                              )}
-                              {u.isGhost && <span className="text-[10px] text-purple-400 font-bold bg-purple-950/70 px-1.5 py-0.2 rounded border border-purple-500/50">👻 مخفي</span>}
-                              {isSelf && (
-                                <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-500/25 text-amber-300 font-bold border border-amber-500/50">
-                                  أنت
-                                </span>
-                              )}
-                              {isOtherOutside ? (
-                                <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950/70 text-emerald-300 font-semibold border border-emerald-500/40">
-                                  البهو
-                                </span>
-                              ) : (
-                                <span className="text-[10px] px-1.5 py-0.2 rounded bg-indigo-950/70 text-indigo-300 font-semibold border border-indigo-500/40">
-                                  {u.room}
-                                </span>
-                              )}
-                            </div>
-                            {u.statusQuote && u.statusQuote.trim() !== '..' && u.statusQuote.trim() !== '' && (
-                              <div className={`text-[10px] truncate max-w-[200px] sm:max-w-[260px] mt-0.5 ${bgUrl ? 'text-slate-100 drop-shadow-xs' : 'text-slate-400'}`}>
-                                {u.statusQuote}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-2 flex-shrink-0">
-                          {!isSelf && (currentUser.role === 'hassan' || currentUser.role === 'admin' || currentUser.role === 'super' || getRoleLevel(currentUser.role) >= 75) && (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                socket?.emit('revealNicks', { targetUsername: u.username });
-                              }}
-                              className="px-2 py-0.5 bg-amber-500 hover:bg-amber-600 text-black text-[10px] font-black rounded cursor-pointer"
-                            >
-                              كشف
-                            </button>
-                          )}
-                          <div
-                            className="flex flex-col items-center justify-center leading-none select-none flex-shrink-0"
-                            title={getCountryNameFromFlag(u.flag) || undefined}
-                          >
-                            <span className="text-base leading-none">{u.flag}</span>
-                            {getUserFlagNumber(u.username, u.flagNumber) && (
-                              <span className="text-[9px] font-black text-amber-400 bg-slate-900/80 border border-amber-500/40 px-1 py-[1px] rounded mt-0.5 leading-none font-mono">
-                                #{getUserFlagNumber(u.username, u.flagNumber)}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      </>
-                    );
-
-                    if (bgUrl) {
-                      return (
-                        <div
-                          key={u.id || u.username}
-                          onClick={() => openUserProfile(u)}
-                          className={`grid grid-cols-1 overflow-hidden cursor-pointer relative ${
-                            isSelf ? 'border-r-2 border-amber-500' : ''
-                          }`}
-                        >
-                          <img
-                            src={bgUrl}
-                            alt=""
-                            aria-hidden="true"
-                            className="col-start-1 row-start-1 w-full h-auto max-h-[260px] min-h-full object-cover select-none pointer-events-none"
-                            loading="lazy"
-                          />
-                          <div
-                            aria-hidden="true"
-                            className="col-start-1 row-start-1 bg-gradient-to-b from-slate-950/90 via-slate-950/35 to-transparent pointer-events-none"
-                          />
-                          <div className="col-start-1 row-start-1 relative z-10 self-start w-full p-2 flex items-start justify-between gap-2 min-w-0">
-                            {rowInner}
-                          </div>
-                        </div>
-                      );
-                    }
-
-                    return (
-                      <div
-                        key={u.id || u.username}
-                        onClick={() => openUserProfile(u)}
-                        className={`p-2 transition-colors cursor-pointer flex items-center justify-between ${
-                          isSelf
-                            ? 'bg-amber-500/10 hover:bg-amber-500/15 border-r-2 border-amber-500'
-                            : 'hover:bg-white/5'
-                        }`}
-                      >
-                        {rowInner}
-                      </div>
-                    );
-                  })}
-
-                  {/* DIVIDER LINE (خط فاصل يظهر المتواجدين خارج الغرفة أو الأعضاء غير المتصلين) */}
-                  <div className={`flex items-center gap-2 px-2.5 py-1 ${curTheme.subHeaderBg} ${curTheme.accentText} text-[11px] font-bold border-y ${curTheme.subHeaderBorder}`}>
-                    <span className="flex-1 h-px bg-slate-700" />
-                    <span>
-                      {!isCurrentUserOutside
-                        ? `المتواجدون في غرف أخرى أو بهو الشات (${otherConnectedUsers.length})`
-                        : `الأعضاء غير المتصلين (${offlineMembers.length})`}
-                    </span>
-                    <span className="flex-1 h-px bg-slate-700" />
-                  </div>
-
-                  {/* If INSIDE a room: Users in other rooms or in the lobby (Connected: Green Dot) */}
-                  {!isCurrentUserOutside && otherConnectedUsers.map((u) => {
-                    const isOtherOutside = !u.room || u.room === 'خارج الغرف' || u.room.trim() === '';
-                    const bgUrl = resolveMemberBgUrl(u.memberBg || u.profileBg);
-                    const rowInner = (
-                      <>
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          <AvatarWithFrame
-                            src={u.avatarUrl || falconIcon}
-                            alt={u.username}
-                            frame={u.avatarFrame}
-                            size="sm"
-                            presenceState={u.presenceState}
-                            isGhost={u.isGhost}
-                            showPresenceDot
-                            presenceTitle={isOtherOutside ? 'متواجد في بهو الشات (خارج الغرف) 🟢' : `متصل بغرفة (${u.room}) 🟢`}
-                          />
-                          <div className="min-w-0 text-right">
-                            <div className={`font-bold text-xs ${bgUrl ? 'text-white drop-shadow' : curTheme.accentText} flex items-center gap-1 flex-wrap`}>
-                              {u.giftBadges && u.giftBadges.length > 0 && (
-                                <img
-                                  src={u.giftBadges[0]}
-                                  alt="هدية"
-                                  title="هدية تكريمية مرافقة للاسم"
-                                  className="w-4 h-4 sm:w-5 sm:h-5 object-contain inline-block drop-shadow-xs shrink-0 select-none align-middle"
-                                />
-                              )}
-                              {(() => {
-                                const banner = getUserBanner(u.username, u.nameBannerUrl);
-                                if (banner) {
-                                  return (
-                                    <img
-                                      src={banner}
-                                      alt={u.username}
-                                      title={u.username}
-                                      className="h-5 max-h-[24px] max-w-[150px] object-contain drop-shadow-sm select-none inline-block align-middle rounded"
-                                    />
-                                  );
-                                }
-                                return <span>{getUserDisplayName(u.username, u.displayName)}</span>;
-                              })()}
-                              {u.giftBadges && u.giftBadges.length > 1 && (
-                                <span className="inline-flex items-center gap-0.5 mx-0.5 align-middle">
-                                  {u.giftBadges.slice(1).map((badgeUrl, bIdx) => (
-                                    <img
-                                      key={bIdx}
-                                      src={badgeUrl}
-                                      alt="وسام"
-                                      title="وسام شرفي"
-                                      className="w-3.5 h-3.5 object-contain inline-block drop-shadow-xs opacity-90"
-                                    />
-                                  ))}
-                                </span>
-                              )}
-                              {isOtherOutside ? (
-                                <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950/70 text-emerald-300 font-semibold border border-emerald-500/40">
-                                  البهو
-                                </span>
-                              ) : (
-                                <span className="text-[10px] px-1.5 py-0.2 rounded bg-indigo-950/70 text-indigo-300 font-semibold border border-indigo-500/40">
-                                  {u.room}
-                                </span>
-                              )}
-                            </div>
-                            {u.statusQuote && u.statusQuote.trim() !== '..' && u.statusQuote.trim() !== '' && (
-                              <div className={`text-[10px] truncate max-w-[200px] sm:max-w-[260px] mt-0.5 ${bgUrl ? 'text-slate-100 drop-shadow-xs' : 'text-slate-400'}`}>
-                                {u.statusQuote}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-2 flex-shrink-0">
-                          {(currentUser.role === 'hassan' || currentUser.role === 'admin' || currentUser.role === 'super' || getRoleLevel(currentUser.role) >= 75) && (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                socket?.emit('revealNicks', { targetUsername: u.username });
-                              }}
-                              className="px-2 py-0.5 bg-amber-500 hover:bg-amber-600 text-black text-[10px] font-black rounded"
-                            >
-                              كشف
-                            </button>
-                          )}
-                          <div
-                            className="flex flex-col items-center justify-center leading-none select-none flex-shrink-0"
-                            title={getCountryNameFromFlag(u.flag) || undefined}
-                          >
-                            <span className="text-base leading-none">{u.flag}</span>
-                            {getUserFlagNumber(u.username, u.flagNumber) && (
-                              <span className="text-[9px] font-black text-amber-400 bg-slate-900/80 border border-amber-500/40 px-1 py-[1px] rounded mt-0.5 leading-none font-mono">
-                                #{getUserFlagNumber(u.username, u.flagNumber)}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      </>
-                    );
-
-                    if (bgUrl) {
-                      return (
-                        <div
-                          key={u.id}
-                          onClick={() => openUserProfile(u)}
-                          className="grid grid-cols-1 overflow-hidden cursor-pointer relative"
-                        >
-                          <img
-                            src={bgUrl}
-                            alt=""
-                            aria-hidden="true"
-                            className="col-start-1 row-start-1 w-full h-auto max-h-[260px] min-h-full object-cover select-none pointer-events-none"
-                            loading="lazy"
-                          />
-                          <div
-                            aria-hidden="true"
-                            className="col-start-1 row-start-1 bg-gradient-to-b from-slate-950/90 via-slate-950/35 to-transparent pointer-events-none"
-                          />
-                          <div className="col-start-1 row-start-1 relative z-10 self-start w-full px-2.5 pt-3 pb-2.5 flex items-start justify-between gap-2 min-w-0">
-                            {rowInner}
-                          </div>
-                        </div>
-                      );
-                    }
-
-                    return (
-                      <div
-                        key={u.id}
-                        onClick={() => openUserProfile(u)}
-                        className="p-2.5 hover:bg-white/5 transition-colors cursor-pointer flex items-center justify-between"
-                      >
-                        {rowInner}
-                      </div>
-                    );
-                  })}
-
-                  {/* Additional divider for offline members when user is inside a room */}
-                  {!isCurrentUserOutside && offlineMembers.length > 0 && (
-                    <div className={`flex items-center gap-2 px-3 py-2 ${curTheme.subHeaderBg} ${curTheme.accentText} text-xs font-bold border-y ${curTheme.subHeaderBorder}`}>
-                      <span className="flex-1 h-px bg-slate-700" />
-                      <span>الأعضاء غير المتصلين ({offlineMembers.length})</span>
-                      <span className="flex-1 h-px bg-slate-700" />
-                    </div>
-                  )}
-
-                  {/* Disconnected Members (Outside rooms: Gray Dot) */}
-                  {offlineMembers.map((m) => {
-                    const bgUrl = resolveMemberBgUrl(m.memberBg || m.profileBg);
-                    const openOfflineProfile = () => {
-                      const simulatedUser: User = {
-                        id: `offline-${m.username}`,
-                        username: m.username,
-                        displayName: m.displayName || m.username,
-                        avatarSeed: m.username,
-                        role: m.role as any,
-                        flag: m.flag,
-                        flagNumber: m.flagNumber,
-                        statusQuote: m.statusQuote,
-                        avatarUrl: m.avatarUrl,
-                        avatarFrame: m.avatarFrame,
-                        memberBg: m.memberBg,
-                        profileBg: m.profileBg,
-                        nameBannerUrl: m.nameBannerUrl,
-                        giftBadges: m.giftBadges,
-                        likes: m.likes || 100,
-                        points: 500,
-                        isVoice: false,
-                        isSpeaking: false,
-                        micSlot: null,
-                        isMuted: false,
-                        isTextMuted: false,
-                        room: 'خارج الغرف'
-                      };
-                      openUserProfile(simulatedUser);
-                    };
-
-                    const rowInner = (
-                      <>
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          <AvatarWithFrame
-                            src={m.avatarUrl || falconIcon}
-                            alt={m.username}
-                            frame={m.avatarFrame}
-                            size="sm"
-                            presenceState="offline"
-                            grayscale
-                            showPresenceDot
-                            presenceTitle="عضوية غير متصلة (خارج الغرف)"
-                          />
-                          <div className="min-w-0 text-right">
-                            <div className={`font-bold text-xs ${bgUrl ? 'text-white drop-shadow' : 'text-slate-300'} flex items-center gap-1 flex-wrap`}>
-                              {m.giftBadges && m.giftBadges.length > 0 && (
-                                <img
-                                  src={m.giftBadges[0]}
-                                  alt="هدية"
-                                  title="هدية تكريمية مرافقة للاسم"
-                                  className="w-4 h-4 sm:w-5 sm:h-5 object-contain inline-block drop-shadow-xs shrink-0 select-none align-middle"
-                                />
-                              )}
-                              {(() => {
-                                const banner = getUserBanner(m.username, m.nameBannerUrl);
-                                if (banner) {
-                                  return (
-                                    <img
-                                      src={banner}
-                                      alt={m.username}
-                                      title={m.username}
-                                      className="h-5 max-h-[24px] max-w-[140px] object-contain drop-shadow-sm select-none inline-block align-middle rounded opacity-85"
-                                    />
-                                  );
-                                }
-                                return <span>{getUserDisplayName(m.username, m.displayName)}</span>;
-                              })()}
-                              {m.giftBadges && m.giftBadges.length > 1 && (
-                                <span className="inline-flex items-center gap-0.5 mx-0.5 align-middle">
-                                  {m.giftBadges.slice(1).map((badgeUrl, bIdx) => (
-                                    <img
-                                      key={bIdx}
-                                      src={badgeUrl}
-                                      alt="وسام"
-                                      title="وسام شرفي"
-                                      className="w-3.5 h-3.5 object-contain inline-block drop-shadow-xs opacity-90"
-                                    />
-                                  ))}
-                                </span>
-                              )}
-                              <span className="text-[9px] px-1 py-0.2 rounded bg-slate-800 text-slate-400 border border-slate-700">
-                                خارج الغرف
-                              </span>
-                            </div>
-                            <div className={`text-[10px] truncate max-w-[150px] ${bgUrl ? 'text-slate-200 drop-shadow-xs' : 'text-slate-400'}`}>
-                              {m.statusQuote || 'عضو مسجل • غير متصل'}
-                            </div>
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-1.5 flex-shrink-0">
-                          {(currentUser.role === 'hassan' || currentUser.role === 'admin' || currentUser.role === 'super' || getRoleLevel(currentUser.role) >= 75) && (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                socket?.emit('revealNicks', { targetUsername: m.username });
-                              }}
-                              className="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 text-slate-200 text-[10px] font-bold rounded cursor-pointer"
-                            >
-                              كشف
-                            </button>
-                          )}
-                          <div className="flex items-center gap-1.5 opacity-80">
-                            <div className="flex flex-col items-center justify-center leading-none">
-                              <span className="text-base leading-none">{m.flag}</span>
-                              {getUserFlagNumber(m.username, m.flagNumber) && (
-                                <span className="text-[9px] font-black text-amber-400 bg-slate-900/80 border border-amber-500/40 px-1 py-[1px] rounded mt-0.5 leading-none font-mono">
-                                  #{getUserFlagNumber(m.username, m.flagNumber)}
-                                </span>
-                              )}
-                            </div>
-                            {getCountryNameFromFlag(m.flag) && (
-                              <span className="text-[10px] text-slate-400 font-bold whitespace-nowrap">
-                                {getCountryNameFromFlag(m.flag)}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      </>
-                    );
-
-                    if (bgUrl) {
-                      return (
-                        <div
-                          key={m.username}
-                          onClick={openOfflineProfile}
-                          className="grid grid-cols-1 overflow-hidden cursor-pointer relative opacity-90"
-                        >
-                          <img
-                            src={bgUrl}
-                            alt=""
-                            aria-hidden="true"
-                            className="col-start-1 row-start-1 w-full h-auto max-h-[260px] min-h-full object-cover select-none pointer-events-none"
-                            loading="lazy"
-                          />
-                          <div
-                            aria-hidden="true"
-                            className="col-start-1 row-start-1 bg-gradient-to-b from-slate-950/90 via-slate-950/40 to-transparent pointer-events-none"
-                          />
-                          <div className="col-start-1 row-start-1 relative z-10 self-start w-full px-2 py-2 flex items-start justify-between gap-2 min-w-0">
-                            {rowInner}
-                          </div>
-                        </div>
-                      );
-                    }
-
-                    return (
-                      <div
-                        key={m.username}
-                        onClick={openOfflineProfile}
-                        className="p-2 hover:bg-white/5 transition-colors cursor-pointer flex items-center justify-between opacity-80"
-                      >
-                        {rowInner}
-                      </div>
-                    );
-                  })}
-                </div>
-              );
-            })()}
-          </div>
+          <MembersRosterDrawer
+            onClose={() => setActiveDrawer('none')}
+            currentUser={currentUser}
+            curTheme={curTheme}
+            falconIcon={falconIcon}
+            searchQuery={searchUserQuery}
+            onSearchChange={setSearchUserQuery}
+            isCurrentUserOutside={rosterDrawerLists.isCurrentUserOutside}
+            currentRoomUsers={rosterDrawerLists.currentRoomUsers}
+            otherConnectedUsers={rosterDrawerLists.otherConnectedUsers}
+            offlineMembers={rosterDrawerLists.offlineMembers}
+            getUserBanner={getUserBanner}
+            getUserDisplayName={getUserDisplayName}
+            getUserFlagNumber={getUserFlagNumber}
+            getCountryNameFromFlag={getCountryNameFromFlag}
+            getRoleShortName={(role) => getRoleBadge(role).short}
+            getRoleLevel={getRoleLevel}
+            isUserIgnored={isUserIgnored}
+            onOpenUserProfile={openUserProfile}
+            onOpenPrivateChat={(targetUser) => {
+              setSelectedPmUser(targetUser);
+              setActiveDrawer('pm');
+            }}
+            onInsertMention={(username) => {
+              insertMention(username);
+              setActiveDrawer('none');
+              showToast(`تمت إضافة منشن @${username} لحقل الكتابة`, 'info');
+            }}
+            onRevealNicks={(targetUsername) => {
+              socket?.emit('revealNicks', { targetUsername });
+            }}
+          />
         )}
 
         {/* 3. WALL / الحائط DRAWER (Compact layout) */}
